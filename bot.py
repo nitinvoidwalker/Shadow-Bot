@@ -30,7 +30,7 @@ import asyncio
 import aiohttp
 from datetime import datetime, time
 import pytz
-from pymongo import MongoClient
+import motor.motor_asyncio
 
 # ── CONFIG ────────────────────────────────────────────────────────
 TOKEN        = os.getenv("DISCORD_TOKEN")
@@ -43,7 +43,7 @@ EOD_MINUTE   = int(os.getenv("EOD_MINUTE", "55"))
 MONGO_URI    = os.getenv("MONGO_URI")  # <-- Add this env var in your host
 
 # ── MONGODB SETUP ─────────────────────────────────────────────────
-# Connects to MongoDB Atlas (free tier). All persistent data lives there.
+# Uses motor (async MongoDB driver) so it never blocks Discord's event loop.
 # Falls back to local data.json if MONGO_URI is not set (for local dev).
 
 _mongo_client = None
@@ -52,7 +52,7 @@ _db = None
 def get_db():
     global _mongo_client, _db
     if MONGO_URI and _db is None:
-        _mongo_client = MongoClient(MONGO_URI)
+        _mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
         _db = _mongo_client["shadowbot"]
     return _db
 
@@ -72,13 +72,12 @@ def get_db():
 
 DATA_FILE = "data.json"
 
-def load_data():
+async def load_data():
     db = get_db()
 
     if db is not None:
-        # Load persistent fields from MongoDB
-        doc = db["config"].find_one({"_id": "main"}) or {}
-        members_doc = db["members"].find_one({"_id": "list"}) or {}
+        doc = await db["config"].find_one({"_id": "main"}) or {}
+        members_doc = await db["members"].find_one({"_id": "list"}) or {}
         return {
             "base_echo_rate": doc.get("base_echo_rate", 500),
             "links":          doc.get("links", {}),
@@ -87,7 +86,6 @@ def load_data():
             "members":        members_doc.get("members", []),
         }
     else:
-        # Fallback: local file (for local development without MongoDB)
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, "r") as f:
                 return json.load(f)
@@ -99,12 +97,11 @@ def load_data():
             "members": []
         }
 
-def save_data(data):
+async def save_data(data):
     db = get_db()
 
     if db is not None:
-        # Save config (links, todos, etc.) to MongoDB
-        db["config"].update_one(
+        await db["config"].update_one(
             {"_id": "main"},
             {"$set": {
                 "base_echo_rate": data.get("base_echo_rate", 500),
@@ -114,14 +111,12 @@ def save_data(data):
             }},
             upsert=True
         )
-        # Save members separately (they're large and synced from GAS)
-        db["members"].update_one(
+        await db["members"].update_one(
             {"_id": "list"},
             {"$set": {"members": data.get("members", [])}},
             upsert=True
         )
     else:
-        # Fallback: local file
         with open(DATA_FILE, "w") as f:
             json.dump(data, f, indent=2)
 
@@ -178,7 +173,7 @@ async def pull_from_gas(data: dict):
                 members = json.loads(text)
                 if isinstance(members, list) and members:
                     data["members"] = members
-                    save_data(data)
+                    await save_data(data)
                     return True
     except Exception as e:
         print(f"[GAS PULL ERROR] {e}")
@@ -210,7 +205,7 @@ async def push_to_gas(data: dict):
 # ── END OF DAY CALCULATION ────────────────────────────────────────
 async def run_end_of_day(guild: discord.Guild, announce=True):
     """Calculate echoes for all linked members based on todo completion."""
-    data = load_data()
+    data = await load_data()
     base = data.get("base_echo_rate", 500)
     results = []
 
@@ -246,7 +241,7 @@ async def run_end_of_day(guild: discord.Guild, announce=True):
 
         data["todos"][discord_id] = []
 
-    save_data(data)
+    await save_data(data)
     await push_to_gas(data)
 
     if announce and results:
@@ -288,7 +283,7 @@ todo_group = app_commands.Group(name="todo", description="Manage your operative 
 @todo_group.command(name="add", description="Log a new objective to your dossier")
 @app_commands.describe(task="The objective to be carried out")
 async def todo_add(interaction: discord.Interaction, task: str):
-    data = load_data()
+    data = await load_data()
     uid  = str(interaction.user.id)
 
     if not get_shadow_id(uid, data):
@@ -300,7 +295,7 @@ async def todo_add(interaction: discord.Interaction, task: str):
 
     data["todos"].setdefault(uid, [])
     data["todos"][uid].append({"task": task, "done": False})
-    save_data(data)
+    await save_data(data)
 
     count = len(data["todos"][uid])
     await interaction.response.send_message(
@@ -310,7 +305,7 @@ async def todo_add(interaction: discord.Interaction, task: str):
 @todo_group.command(name="done", description="Mark an objective as fulfilled")
 @app_commands.describe(number="Objective number (from /todo list)")
 async def todo_done(interaction: discord.Interaction, number: int):
-    data = load_data()
+    data = await load_data()
     uid  = str(interaction.user.id)
     todos = data["todos"].get(uid, [])
 
@@ -323,7 +318,7 @@ async def todo_done(interaction: discord.Interaction, number: int):
 
     todos[number - 1]["done"] = True
     data["todos"][uid] = todos
-    save_data(data)
+    await save_data(data)
 
     done  = sum(1 for t in todos if t["done"])
     total = len(todos)
@@ -343,7 +338,7 @@ async def todo_done(interaction: discord.Interaction, number: int):
 
 @todo_group.command(name="list", description="View your operative dossier")
 async def todo_list(interaction: discord.Interaction):
-    data  = load_data()
+    data  = await load_data()
     uid   = str(interaction.user.id)
     todos = data["todos"].get(uid, [])
 
@@ -370,10 +365,10 @@ async def todo_list(interaction: discord.Interaction):
 
 @todo_group.command(name="clear", description="Purge your entire dossier")
 async def todo_clear(interaction: discord.Interaction):
-    data = load_data()
+    data = await load_data()
     uid  = str(interaction.user.id)
     data["todos"][uid] = []
-    save_data(data)
+    await save_data(data)
     await interaction.response.send_message(
         embed=make_embed("◈ DOSSIER PURGED", f"**{interaction.user.display_name}** has erased all traces. The slate is void. A new cycle begins.", color=0x6B6B9A)
     )
@@ -381,7 +376,7 @@ async def todo_clear(interaction: discord.Interaction):
 @todo_group.command(name="multiadd", description="Log multiple objectives at once (comma separated)")
 @app_commands.describe(tasks="Objectives separated by commas e.g. Infiltrate base, Secure the relic, Vanish")
 async def todo_multiadd(interaction: discord.Interaction, tasks: str):
-    data = load_data()
+    data = await load_data()
     uid  = str(interaction.user.id)
 
     if not get_shadow_id(uid, data):
@@ -403,7 +398,7 @@ async def todo_multiadd(interaction: discord.Interaction, tasks: str):
     start_count = len(data["todos"][uid])
     for task in task_list:
         data["todos"][uid].append({"task": task, "done": False})
-    save_data(data)
+    await save_data(data)
 
     lines = [f"**#{start_count + i + 1}** · *{t}*" for i, t in enumerate(task_list)]
     await interaction.response.send_message(
@@ -419,7 +414,7 @@ tree.add_command(todo_group)
 # ── /echoes ───────────────────────────────────────────────────────
 @tree.command(name="echoes", description="Reveal your echo resonance and operative rank")
 async def echoes(interaction: discord.Interaction):
-    data      = load_data()
+    data      = await load_data()
     uid       = str(interaction.user.id)
     shadow_id = get_shadow_id(uid, data)
 
@@ -433,7 +428,7 @@ async def echoes(interaction: discord.Interaction):
     member = get_member(shadow_id, data)
     if not member:
         await pull_from_gas(data)
-        member = get_member(shadow_id, load_data())
+        member = get_member(shadow_id, await load_data())
 
     if not member:
         await interaction.response.send_message(
@@ -460,10 +455,10 @@ async def echoes(interaction: discord.Interaction):
 # ── /leaderboard ──────────────────────────────────────────────────
 @tree.command(name="leaderboard", description="The most powerful operatives in the Order")
 async def leaderboard(interaction: discord.Interaction):
-    data = load_data()
+    data = await load_data()
     if not data["members"]:
         await pull_from_gas(data)
-        data = load_data()
+        data = await load_data()
 
     sorted_m = sorted(data["members"], key=lambda m: int(m.get("echoCount", 0)), reverse=True)[:10]
 
@@ -490,7 +485,7 @@ async def leaderboard(interaction: discord.Interaction):
 @tree.command(name="link", description="Bind your Discord identity to your Shadow ID")
 @app_commands.describe(shadow_id="Your Shadow ID (e.g. SS0069)")
 async def link(interaction: discord.Interaction, shadow_id: str):
-    data     = load_data()
+    data     = await load_data()
     uid      = str(interaction.user.id)
     sid      = shadow_id.upper().strip()
 
@@ -518,7 +513,7 @@ async def link(interaction: discord.Interaction, shadow_id: str):
             return
 
     data["pending_links"][uid] = sid
-    save_data(data)
+    await save_data(data)
 
     ch = discord.utils.get(interaction.guild.text_channels, name=APPROVE_CH)
     if ch:
@@ -547,7 +542,7 @@ async def approve(interaction: discord.Interaction, user: discord.Member):
         await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946), ephemeral=True)
         return
 
-    data = load_data()
+    data = await load_data()
     uid  = str(user.id)
     sid  = data["pending_links"].get(uid)
 
@@ -560,7 +555,7 @@ async def approve(interaction: discord.Interaction, user: discord.Member):
 
     data["links"][uid] = {"shadow_id": sid, "approved": True}
     del data["pending_links"][uid]
-    save_data(data)
+    await save_data(data)
 
     try:
         await user.send(embed=make_embed(
@@ -584,7 +579,7 @@ async def give(interaction: discord.Interaction, user: discord.Member, amount: i
         await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946), ephemeral=True)
         return
 
-    data      = load_data()
+    data      = await load_data()
     uid       = str(user.id)
     shadow_id = get_shadow_id(uid, data)
 
@@ -600,7 +595,7 @@ async def give(interaction: discord.Interaction, user: discord.Member, amount: i
             old = int(m.get("echoCount", 0))
             new = max(0, old + amount)
             data["members"][i]["echoCount"] = new
-            save_data(data)
+            await save_data(data)
             await push_to_gas(data)
             sign = "+" if amount >= 0 else ""
             await interaction.response.send_message(
@@ -621,9 +616,9 @@ async def setbase(interaction: discord.Interaction, amount: int):
     if not is_admin(interaction):
         await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946), ephemeral=True)
         return
-    data = load_data()
+    data = await load_data()
     data["base_echo_rate"] = max(1, amount)
-    save_data(data)
+    await save_data(data)
     await interaction.response.send_message(
         embed=make_embed("◉ RESONANCE RECALIBRATED", f"The daily echo threshold has been set to **{amount:,}**. The Order adjusts.", color=0x10B981)
     )
@@ -654,9 +649,9 @@ async def sync_cmd(interaction: discord.Interaction):
         await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946), ephemeral=True)
         return
     await interaction.response.send_message(embed=make_embed("◉ REACHING INTO THE VOID", "Pulling data from the shadow archive...", color=0xA855F7), ephemeral=True)
-    data = load_data()
+    data = await load_data()
     ok   = await pull_from_gas(data)
-    data = load_data()
+    data = await load_data()
     if ok:
         await interaction.followup.send(
             embed=make_embed("◉ ARCHIVE SYNCED", f"**{len(data['members'])}** operatives recalled from the shadows.", color=0x10B981),
@@ -683,9 +678,10 @@ async def on_ready():
     except Exception as e:
         print(f"[SHADOW BOT] Sync error: {e}")
 
-    data = load_data()
+    data = await load_data()
     await pull_from_gas(data)
-    print(f"[SHADOW BOT] Loaded {len(load_data()['members'])} members from GAS")
+    loaded = await load_data()
+    print(f"[SHADOW BOT] Loaded {len(loaded['members'])} members from GAS")
 
     daily_echo_task.start()
     print(f"[SHADOW BOT] Daily task scheduled at {EOD_HOUR}:{EOD_MINUTE:02d} {TIMEZONE}")
