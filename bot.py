@@ -41,9 +41,12 @@ APPROVE_CH   = os.getenv("APPROVE_CHANNEL", "admin-log")
 TIMEZONE     = os.getenv("TIMEZONE", "Asia/Kolkata")
 EOD_HOUR     = int(os.getenv("EOD_HOUR", "23"))
 EOD_MINUTE   = int(os.getenv("EOD_MINUTE", "55"))
-MONGO_URI    = os.getenv("MONGO_URI")
+MONGO_URI    = os.getenv("MONGO_URI")  # <-- Add this env var in your host
 
 # ── MONGODB SETUP ─────────────────────────────────────────────────
+# Uses motor (async MongoDB driver) so it never blocks Discord's event loop.
+# Falls back to local data.json if MONGO_URI is not set (for local dev).
+
 _mongo_client = None
 _db = None
 
@@ -55,10 +58,24 @@ def get_db():
     return _db
 
 # ── DATA LOAD/SAVE ────────────────────────────────────────────────
+# "data" dict schema (same as before):
+# {
+#   "base_echo_rate": 500,
+#   "links": { "discord_user_id": {"shadow_id": "SS0001", "approved": true} },
+#   "pending_links": { "discord_user_id": "SS0001" },
+#   "todos": { "discord_user_id": [ {"task": "...", "done": false}, ... ] },
+#   "members": [ { ...shadowrecord member objects... } ]
+# }
+#
+# With MongoDB:
+#   - links, pending_links, todos, base_echo_rate → stored in MongoDB (persistent)
+#   - members → still synced from GAS (as before)
+
 DATA_FILE = "data.json"
 
 async def load_data():
     db = get_db()
+
     if db is not None:
         doc = await db["config"].find_one({"_id": "main"}) or {}
         members_doc = await db["members"].find_one({"_id": "list"}) or {}
@@ -83,6 +100,7 @@ async def load_data():
 
 async def save_data(data):
     db = get_db()
+
     if db is not None:
         await db["config"].update_one(
             {"_id": "main"},
@@ -148,6 +166,7 @@ def make_embed(title, description="", color=0x7B2FBE):
 
 # ── GAS SYNC ──────────────────────────────────────────────────────
 async def pull_from_gas(data: dict):
+    """Pull latest members from GAS sheet into local data."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(GAS_URL + "?action=read", allow_redirects=True) as resp:
@@ -162,6 +181,7 @@ async def pull_from_gas(data: dict):
     return False
 
 async def push_to_gas(data: dict):
+    """Push updated members to GAS sheet."""
     try:
         payload = json.dumps({
             "action": "write",
@@ -185,6 +205,7 @@ async def push_to_gas(data: dict):
 
 # ── END OF DAY CALCULATION ────────────────────────────────────────
 async def run_end_of_day(guild: discord.Guild, announce=True):
+    """Calculate echoes for all linked members based on todo completion."""
     data = await load_data()
     base = data.get("base_echo_rate", 500)
     results = []
@@ -268,7 +289,7 @@ async def todo_add(interaction: discord.Interaction, task: str):
 
     if not get_shadow_id(uid, data):
         await interaction.response.send_message(
-            embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first — use `/link <shadow_id>`.", color=0xE63946)
+            embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first — use `/link <shadow_id>`.", color=0xE63946),
         )
         return
 
@@ -290,7 +311,7 @@ async def todo_done(interaction: discord.Interaction, number: int):
 
     if not todos or number < 1 or number > len(todos):
         await interaction.response.send_message(
-            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective #{number} doesn't exist. Check `/todo list`.", color=0xE63946)
+            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective #{number} doesn't exist. Check `/todo list`.", color=0xE63946),
         )
         return
 
@@ -385,14 +406,14 @@ async def todo_multiadd(interaction: discord.Interaction, tasks: str):
 
     if not get_shadow_id(uid, data):
         await interaction.response.send_message(
-            embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first — use `/link <shadow_id>`.", color=0xE63946)
+            embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first — use `/link <shadow_id>`.", color=0xE63946),
         )
         return
 
     task_list = [t.strip() for t in tasks.split(",") if t.strip()]
     if not task_list:
         await interaction.response.send_message(
-            embed=make_embed("▲ NOTHING TO ADD", "No objectives found. Separate them with commas.", color=0xE63946)
+            embed=make_embed("▲ NOTHING TO ADD", "No objectives found. Separate them with commas.", color=0xE63946),
         )
         return
 
@@ -422,7 +443,7 @@ async def echoes(interaction: discord.Interaction):
 
     if not shadow_id:
         await interaction.response.send_message(
-            embed=make_embed("▲ NOT LINKED", "No Shadow ID linked. Use `/link <shadow_id>` to get started.", color=0xE63946)
+            embed=make_embed("▲ NOT LINKED", "No Shadow ID linked. Use `/link <shadow_id>` to get started.", color=0xE63946),
         )
         return
 
@@ -433,7 +454,7 @@ async def echoes(interaction: discord.Interaction):
 
     if not member:
         await interaction.response.send_message(
-            embed=make_embed("▲ OPERATIVE NOT FOUND", f"Shadow ID `{shadow_id}` has no record in the void.", color=0xE63946)
+            embed=make_embed("▲ OPERATIVE NOT FOUND", f"Shadow ID `{shadow_id}` has no record in the void.", color=0xE63946),
         )
         return
 
@@ -445,10 +466,10 @@ async def echoes(interaction: discord.Interaction):
     proj  = round(data.get("base_echo_rate", 500) * done / total) if total else 0
 
     embed = discord.Embed(title=f"☽ {member['codename']}", color=tier["color"])
-    embed.add_field(name="Shadow ID",          value=f"`{shadow_id}`",             inline=True)
-    embed.add_field(name="Echo Resonance",     value=f"**{count:,}**",             inline=True)
-    embed.add_field(name="Rank",               value=f"**{tier['name'].upper()}**", inline=True)
-    embed.add_field(name="Today's Objectives", value=f"{done}/{total} fulfilled · +{proj} resonating", inline=False)
+    embed.add_field(name="Shadow ID",        value=f"`{shadow_id}`",             inline=True)
+    embed.add_field(name="Echo Resonance",   value=f"**{count:,}**",             inline=True)
+    embed.add_field(name="Rank",             value=f"**{tier['name'].upper()}**", inline=True)
+    embed.add_field(name="Today's Objectives",  value=f"{done}/{total} fulfilled · +{proj} resonating", inline=False)
     embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
     await interaction.response.send_message(embed=embed)
 
@@ -464,7 +485,7 @@ async def leaderboard(interaction: discord.Interaction):
 
     if not sorted_m:
         await interaction.response.send_message(
-            embed=make_embed("▲ NO DATA", "No operatives found. Try `/sync` first.", color=0xE63946)
+            embed=make_embed("▲ NO DATA", "No operatives found. Try `/sync` first.", color=0xE63946),
         )
         return
 
@@ -490,21 +511,21 @@ async def link(interaction: discord.Interaction, shadow_id: str):
 
     if get_shadow_id(uid, data):
         await interaction.response.send_message(
-            embed=make_embed("▲ ALREADY LINKED", f"Already linked to `{data['links'][uid]['shadow_id']}`.", color=0xE63946)
+            embed=make_embed("▲ ALREADY LINKED", f"Already linked to `{data['links'][uid]['shadow_id']}`.", color=0xE63946),
         )
         return
 
     import re
     if not re.match(r'^SS\d{4}$', sid):
         await interaction.response.send_message(
-            embed=make_embed("▲ INVALID SHADOW ID", "The format must be `SS####` — e.g. `SS0069`. Check your credentials.", color=0xE63946)
+            embed=make_embed("▲ INVALID SHADOW ID", "The format must be `SS####` — e.g. `SS0069`. Check your credentials.", color=0xE63946),
         )
         return
 
     for existing_link in data["links"].values():
         if existing_link["shadow_id"] == sid and existing_link.get("approved"):
             await interaction.response.send_message(
-                embed=make_embed("▲ ID ALREADY TAKEN", f"`{sid}` is already linked to someone else. Contact an admin if this is wrong.", color=0xE63946)
+                embed=make_embed("▲ ID ALREADY TAKEN", f"`{sid}` is already linked to someone else. Contact an admin if this is wrong.", color=0xE63946),
             )
             return
 
@@ -528,7 +549,7 @@ async def link(interaction: discord.Interaction, shadow_id: str):
             "◈ REQUEST SENT",
             f"Your request to link `{sid}` has been sent into the void.\nAwait authorization from the Order.",
             color=0xA855F7
-        )
+        ),
     )
 
 # ── /approve ──────────────────────────────────────────────────────
@@ -545,7 +566,7 @@ async def approve(interaction: discord.Interaction, user: discord.Member):
 
     if not sid:
         await interaction.response.send_message(
-            embed=make_embed("▲ NO REQUEST FOUND", f"**{user.display_name}** has no pending link request.", color=0xE63946)
+            embed=make_embed("▲ NO REQUEST FOUND", f"**{user.display_name}** has no pending link request.", color=0xE63946),
         )
         return
 
@@ -563,7 +584,7 @@ async def approve(interaction: discord.Interaction, user: discord.Member):
         pass
 
     await interaction.response.send_message(
-        embed=make_embed("◉ APPROVED", f"**{user.display_name}** is now linked to `{sid}`.", color=0x10B981)
+        embed=make_embed("◉ APPROVED", f"**{user.display_name}** is now linked to `{sid}`.", color=0x10B981),
     )
 
 # ── /give ─────────────────────────────────────────────────────────
@@ -580,7 +601,7 @@ async def give(interaction: discord.Interaction, user: discord.Member, amount: i
 
     if not shadow_id:
         await interaction.response.send_message(
-            embed=make_embed("▲ OPERATIVE UNBOUND", f"**{user.display_name}** has no bound Shadow ID.", color=0xE63946)
+            embed=make_embed("▲ OPERATIVE UNBOUND", f"**{user.display_name}** has no bound Shadow ID.", color=0xE63946),
         )
         return
 
@@ -614,7 +635,7 @@ async def setbase(interaction: discord.Interaction, amount: int):
     data["base_echo_rate"] = max(1, amount)
     await save_data(data)
     await interaction.response.send_message(
-        embed=make_embed("◉ RESONANCE RECALIBRATED", f"The daily echo threshold has been set to **{amount:,}**.", color=0x10B981)
+        embed=make_embed("◉ RESONANCE RECALIBRATED", f"The daily echo threshold has been set to **{amount:,}**. ", color=0x10B981)
     )
 
 # ── /forceday ─────────────────────────────────────────────────────
@@ -648,11 +669,11 @@ async def sync_cmd(interaction: discord.Interaction):
     data = await load_data()
     if ok:
         await interaction.followup.send(
-            embed=make_embed("◉ SYNC COMPLETE", f"**{len(data['members'])}** operatives loaded.", color=0x10B981)
+            embed=make_embed("◉ SYNC COMPLETE", f"**{len(data['members'])}** operatives loaded.", color=0x10B981),
         )
     else:
         await interaction.followup.send(
-            embed=make_embed("▲ SYNC FAILED", "Could not reach the archive. Check the GAS URL.", color=0xE63946)
+            embed=make_embed("▲ SYNC FAILED", "Could not reach the archive. Check the GAS URL.", color=0xE63946),
         )
 
 # ── BOT EVENTS ────────────────────────────────────────────────────
