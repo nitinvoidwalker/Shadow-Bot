@@ -898,26 +898,35 @@ async def syncids(interaction: discord.Interaction):
 
     data = await load_data()
 
-    # Build a quick lookup of existing member echo data from local cache
-    member_cache = {m["shadowId"]: m for m in data["members"]}
+    # MongoDB is the source of truth for echoCount.
+    # Save this BEFORE pull_from_gas overwrites data["members"] with GAS values
+    # (which may have stale/zero echoes).
+    mongo_echo_cache = {m["shadowId"]: int(m.get("echoCount", 0)) for m in data["members"]}
+
+    # Pull GAS so local cache has the full member list (for save_data later)
+    await pull_from_gas(data)
+    data = await load_data()
+
+    # Restore MongoDB echo values — don't let GAS zeros overwrite real data
+    for m in data["members"]:
+        if m["shadowId"] in mongo_echo_cache:
+            m["echoCount"] = mongo_echo_cache[m["shadowId"]]
 
     # Build list of all approved members to send to GAS
-    # GAS will handle duplicate detection itself (skips existing shadowIds)
+    # GAS handles duplicate detection itself (skips existing shadowIds)
     to_sync     = []
-    id_to_label = {}  # shadowId -> display label for the result embed
+    id_to_label = {}
 
     for discord_id, link in data["links"].items():
         if not link.get("approved"):
             continue
         sid      = link["shadow_id"]
         codename = link.get("codename", f"Operative {sid}")
-        # Use real echoCount from local cache — NOT hardcoded 0
-        cached   = member_cache.get(sid, {})
         to_sync.append({
             "shadowId":  sid,
             "codename":  codename,
             "discordId": discord_id,
-            "echoCount": int(cached.get("echoCount", 0)),
+            "echoCount": mongo_echo_cache.get(sid, 0),  # real echoes from MongoDB
         })
         id_to_label[sid] = f"`{sid}` **{codename}**"
 
