@@ -865,6 +865,79 @@ async def sync_cmd(interaction: discord.Interaction):
             embed=make_embed("▲ SYNC FAILED", "Could not reach the archive. Check the GAS URL.", color=0xE63946),
         )
 
+# ── /syncids ──────────────────────────────────────────────────────
+@tree.command(name="syncids", description="[HIGH CLEARANCE] Create website records for all approved Discord-linked IDs")
+async def syncids(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            embed=make_embed("▲ CLEARANCE DENIED", "This command is restricted to those with high clearance.", color=0xE63946)
+        )
+        return
+
+    await interaction.response.send_message(
+        embed=make_embed("◉ SYNCING IDs", "Scanning approved links and pushing missing records to Shadow Records...", color=0xA855F7)
+    )
+
+    data = await load_data()
+
+    # Pull current website members so we can skip already-existing ones
+    await pull_from_gas(data)
+    data = await load_data()
+    existing_ids = {m["shadowId"] for m in data["members"]}
+
+    created   = []
+    skipped   = []
+    failed    = []
+
+    for discord_id, link in data["links"].items():
+        if not link.get("approved"):
+            continue
+
+        sid      = link["shadow_id"]
+        codename = link.get("codename", f"Operative {sid}")
+
+        if sid in existing_ids:
+            skipped.append(sid)
+            continue
+
+        new_member = {
+            "shadowId":  sid,
+            "codename":  codename,
+            "discordId": discord_id,
+            "echoCount": 0,
+        }
+
+        ok = await create_member_on_gas(new_member)
+
+        if ok:
+            # Also add to local members cache
+            if not any(m["shadowId"] == sid for m in data["members"]):
+                data["members"].append(new_member)
+            created.append(f"`{sid}` **{codename}**")
+        else:
+            failed.append(f"`{sid}` **{codename}**")
+
+    await save_data(data)
+
+    lines = []
+    if created:
+        lines.append(f"**✅ Created ({len(created)}):**\n" + "\n".join(created))
+    if skipped:
+        lines.append(f"**⏭ Already existed ({len(skipped)}):** " + ", ".join(f"`{s}`" for s in skipped))
+    if failed:
+        lines.append(f"**⚠️ Failed ({len(failed)}):**\n" + "\n".join(failed))
+    if not lines:
+        lines.append("No approved links found to process.")
+
+    await interaction.followup.send(
+        embed=make_embed(
+            "☽ ID SYNC COMPLETE",
+            "\n\n".join(lines),
+            color=0x10B981 if not failed else 0xF0A500
+        )
+    )
+
+
 # ── BOT EVENTS ────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
