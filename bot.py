@@ -12,9 +12,13 @@ COMMANDS (all slash commands):
   /todo list                   — view your active dossier
   /todo clear                  — purge your dossier
   /todo date <MM/DD>           — switch active date (default: today)
+  /op add <obj#> <op>          — add an op under an objective
+  /op done <obj#> <op#>        — complete an op under an objective
+  /op remove <obj#> <op#>      — remove an op from an objective
+  /op move <obj#s> <target#>   — convert objectives into ops under target
   /echoes                      — reveal your echo count + rank
   /leaderboard                 — top 10 operatives by echo power
-  /link <shadow_id> <n>     — bind your identity to a Shadow ID
+  /link <shadow_id> <n>        — bind your identity to a Shadow ID
 
 COMMAND ONLY (HIGH CLEARANCE):
   /approve @operative  — authorize an identity bind request
@@ -180,10 +184,12 @@ ECHO_TIERS = [
 
 # Priority emoji suffixes — shown at end of task text
 PRIORITY_EMOJI = {
-    "p1": "🔺",   # 🔺 red triangle
-    "p2": "🟧",   # 🟧 orange square
-    "p3": "🔸",   # 🔸 small orange diamond
+    "p1": "♦️",   # critical
+    "p2": "🔸",   # important
+    "p3": "🏷️",   # normal
 }
+DONE_EMOJI   = "☘️"   # completed objective/op
+UNDONE_EMOJI = "○"    # pending
 
 def get_tier(echo_count: int):
     tier = ECHO_TIERS[0]
@@ -277,9 +283,17 @@ async def run_end_of_day(guild: discord.Guild, announce=True):
             earned = 0
             pct    = 0
         else:
-            total  = len(todos)
-            done   = sum(1 for t in todos if t["done"])
-            pct    = done / total
+            total_weight = len(todos)
+            done_weight  = 0.0
+            for t in todos:
+                ops = t.get("ops", [])
+                if ops:
+                    done_ops = sum(1 for op in ops if op.get("done"))
+                    done_weight += done_ops / len(ops)
+                else:
+                    if t["done"]:
+                        done_weight += 1
+            pct    = done_weight / total_weight
             earned = round(base * pct)
 
         for i, m in enumerate(data["members"]):
@@ -453,11 +467,23 @@ async def todo_done(interaction: discord.Interaction, number: int):
     set_todos_for_date(uid, active, todos, data)
     await save_data(data)
 
-    done  = sum(1 for t in todos if t["done"])
+    # Echo projection with ops-aware weighting
     total = len(todos)
-    pct   = round((done / total) * 100)
+    done_weight = 0.0
+    done_count  = 0
+    for t in todos:
+        ops = t.get("ops", [])
+        if ops:
+            done_ops = sum(1 for op in ops if op.get("done"))
+            done_weight += done_ops / len(ops)
+        else:
+            if t["done"]:
+                done_weight += 1
+                done_count  += 1
+    done  = sum(1 for t in todos if t["done"])
+    pct   = round((done_weight / total) * 100) if total else 0
     base  = data.get("base_echo_rate", 500)
-    proj  = round(base * done / total)
+    proj  = round(base * done_weight / total) if total else 0
 
     is_today  = active == today_str()
     date_note = "" if is_today else f" *(session: {active})*"
@@ -488,18 +514,36 @@ async def todo_list(interaction: discord.Interaction):
         return
 
     lines = []
+    done_weight = 0.0
     for i, t in enumerate(todos, 1):
         priority = t.get("priority")
         suffix   = f" {PRIORITY_EMOJI[priority]}" if priority else ""
-        if t["done"]:
-            lines.append(f"🟢 ~~☽ {i}. {t['task']}~~{suffix}")
-        else:
-            lines.append(f"○ {i}. {t['task']}{suffix}")
+        ops      = t.get("ops", [])
 
-    done  = sum(1 for t in todos if t["done"])
+        # Auto-mark objective done if all ops complete
+        if ops and all(op.get("done") for op in ops):
+            t["done"] = True
+
+        if t["done"]:
+            lines.append(f"{DONE_EMOJI} ~~☽ {i}. {t['task']}~~{suffix}")
+            done_weight += 1
+        else:
+            lines.append(f"{UNDONE_EMOJI} {i}. {t['task']}{suffix}")
+            if ops:
+                done_ops = sum(1 for op in ops if op.get("done"))
+                done_weight += done_ops / len(ops)
+
+        # Render ops as indented sub-lines
+        for op in ops:
+            if op.get("done"):
+                lines.append(f"    └ {DONE_EMOJI} ~~{op['task']}~~")
+            else:
+                lines.append(f"    └ {UNDONE_EMOJI} {op['task']}")
+
     total = len(todos)
     base  = data.get("base_echo_rate", 500)
-    proj  = round(base * done / total) if total else 0
+    proj  = round(base * done_weight / total) if total else 0
+    done  = sum(1 for t in todos if t["done"])
 
     is_today   = active == today_str()
     title_date = "TODAY'S" if is_today else active
@@ -651,7 +695,189 @@ async def todo_priority(interaction: discord.Interaction, level: str, numbers: s
 
 tree.add_command(todo_group)
 
-# ── /echoes ───────────────────────────────────────────────────────
+# ── /op ───────────────────────────────────────────────────────────
+op_group = app_commands.Group(name="op", description="Manage ops (sub-tasks) under objectives")
+
+@op_group.command(name="add", description="Add an op under an objective")
+@app_commands.describe(objective="Objective number", op="The op to add")
+async def op_add(interaction: discord.Interaction, objective: int, op: str):
+    data   = await load_data()
+    uid    = str(interaction.user.id)
+    active = get_active_date(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+
+    if not todos or objective < 1 or objective > len(todos):
+        await interaction.response.send_message(
+            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective #{objective} doesn't exist. Check `/todo list`.", color=0xE63946)
+        )
+        return
+
+    t = todos[objective - 1]
+    if "ops" not in t:
+        t["ops"] = []
+    t["ops"].append({"task": op, "done": False})
+    set_todos_for_date(uid, active, todos, data)
+    await save_data(data)
+
+    op_num = len(t["ops"])
+    await interaction.response.send_message(
+        embed=make_embed(
+            "◉ OP ADDED",
+            f"Op **#{op_num}** added under Objective **#{objective}** · *{todos[objective-1]['task']}*\n\n`└ ○ {op}`",
+            color=0x10B981
+        )
+    )
+
+@op_group.command(name="done", description="Mark an op as complete under an objective")
+@app_commands.describe(objective="Objective number", op="Op number under that objective")
+async def op_done(interaction: discord.Interaction, objective: int, op: int):
+    data   = await load_data()
+    uid    = str(interaction.user.id)
+    active = get_active_date(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+
+    if not todos or objective < 1 or objective > len(todos):
+        await interaction.response.send_message(
+            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective #{objective} doesn't exist. Check `/todo list`.", color=0xE63946)
+        )
+        return
+
+    t   = todos[objective - 1]
+    ops = t.get("ops", [])
+
+    if not ops or op < 1 or op > len(ops):
+        await interaction.response.send_message(
+            embed=make_embed("▲ OP NOT FOUND", f"Op #{op} doesn't exist under Objective #{objective}.", color=0xE63946)
+        )
+        return
+
+    ops[op - 1]["done"] = True
+
+    # Auto-complete objective if all ops done
+    if all(o["done"] for o in ops):
+        t["done"] = True
+
+    set_todos_for_date(uid, active, todos, data)
+    await save_data(data)
+
+    done_ops  = sum(1 for o in ops if o["done"])
+    obj_label = t["task"]
+    auto_note = "\n\n✅ All ops complete — **objective auto-fulfilled.**" if t["done"] else ""
+
+    # Echo projection
+    total_weight = len(todos)
+    done_weight  = 0.0
+    for task in todos:
+        task_ops = task.get("ops", [])
+        if task_ops:
+            done_weight += sum(1 for o in task_ops if o["done"]) / len(task_ops)
+        elif task["done"]:
+            done_weight += 1
+    proj = round(data.get("base_echo_rate", 500) * done_weight / total_weight) if total_weight else 0
+
+    await interaction.response.send_message(
+        embed=make_embed(
+            "☽ OP COMPLETE",
+            f"Op **#{op}** under *{obj_label}* fulfilled.\n`{done_ops}/{len(ops)} ops done`{auto_note}\n\nProjected echoes: **{proj}**",
+            color=0x10B981
+        )
+    )
+
+@op_group.command(name="remove", description="Remove an op from an objective")
+@app_commands.describe(objective="Objective number", op="Op number to remove")
+async def op_remove(interaction: discord.Interaction, objective: int, op: int):
+    data   = await load_data()
+    uid    = str(interaction.user.id)
+    active = get_active_date(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+
+    if not todos or objective < 1 or objective > len(todos):
+        await interaction.response.send_message(
+            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Objective #{objective} doesn't exist. Check `/todo list`.", color=0xE63946)
+        )
+        return
+
+    t   = todos[objective - 1]
+    ops = t.get("ops", [])
+
+    if not ops or op < 1 or op > len(ops):
+        await interaction.response.send_message(
+            embed=make_embed("▲ OP NOT FOUND", f"Op #{op} doesn't exist under Objective #{objective}.", color=0xE63946)
+        )
+        return
+
+    removed = ops.pop(op - 1)
+    set_todos_for_date(uid, active, todos, data)
+    await save_data(data)
+
+    await interaction.response.send_message(
+        embed=make_embed(
+            "◈ OP REMOVED",
+            f"~~{removed['task']}~~ removed from Objective **#{objective}** · *{t['task']}*\n`{len(ops)}` op(s) remaining.",
+            color=0x6B6B9A
+        )
+    )
+
+@op_group.command(name="move", description="Convert objectives into ops under a target objective")
+@app_commands.describe(
+    sources="Objective numbers to convert, comma-separated e.g. 2,3",
+    target="Target objective number they become ops under"
+)
+async def op_move(interaction: discord.Interaction, sources: str, target: int):
+    data   = await load_data()
+    uid    = str(interaction.user.id)
+    active = get_active_date(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+
+    if not todos or target < 1 or target > len(todos):
+        await interaction.response.send_message(
+            embed=make_embed("▲ OBJECTIVE NOT FOUND", f"Target objective #{target} doesn't exist.", color=0xE63946)
+        )
+        return
+
+    try:
+        src_nums = sorted(set(int(n.strip()) for n in sources.split(",") if n.strip()), reverse=True)
+    except ValueError:
+        await interaction.response.send_message(
+            embed=make_embed("▲ INVALID INPUT", "Provide comma-separated numbers e.g. `2,3`.", color=0xE63946)
+        )
+        return
+
+    invalid = [n for n in src_nums if n < 1 or n > len(todos) or n == target]
+    if invalid:
+        await interaction.response.send_message(
+            embed=make_embed("▲ INVALID NUMBERS", f"Numbers {', '.join(str(n) for n in invalid)} are invalid or same as target.", color=0xE63946)
+        )
+        return
+
+    target_task = todos[target - 1]
+    if "ops" not in target_task:
+        target_task["ops"] = []
+
+    moved = []
+    # Remove sources (high→low so indices stay valid) and attach as ops
+    for n in src_nums:
+        removed = todos.pop(n - 1)
+        target_task["ops"].append({"task": removed["task"], "done": removed["done"]})
+        moved.append(removed["task"])
+        # Adjust target index if it shifted
+        if n < target:
+            target -= 1
+
+    set_todos_for_date(uid, active, todos, data)
+    await save_data(data)
+
+    moved_lines = "\n".join(f"    └ ○ {m}" for m in reversed(moved))
+    await interaction.response.send_message(
+        embed=make_embed(
+            "◈ OBJECTIVES CONVERTED TO OPS",
+            f"Now under **{target_task['task']}**:\n{moved_lines}",
+            color=0xA855F7
+        )
+    )
+
+tree.add_command(op_group)
+
 @tree.command(name="echoes", description="Reveal your echo resonance and operative rank")
 async def echoes(interaction: discord.Interaction):
     data      = await load_data()
