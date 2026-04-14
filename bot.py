@@ -21,7 +21,8 @@ COMMANDS (all slash commands):
   /study [task]                — start a focus session (detects VC automatically)
   /pomodoro [task]             — start a 25-min pomodoro session
   /endsession                  — end your active session and submit proof
-  /sessions                    — view your session history this week
+  /sessions                    — weekly analytics: VC hours, completion rates, prime window
+  /setfocuswindow <hour> [min] — set daily focus window for Phantom Alerts (15 min DM warning)
   /echoes                      — reveal your echo count + rank
   /leaderboard                 — top 10 operatives by echo power
   /link <shadow_id> <n>        — bind your identity to a Shadow ID
@@ -115,6 +116,8 @@ async def load_data():
         members_doc  = await db["members"].find_one({"_id": "list"}) or {}
         sessions_doc = await db["sessions"].find_one({"_id": "active"}) or {}
         raw_members  = members_doc.get("members", [])
+        sess_history_doc = await db["session_history"].find_one({"_id": "log"}) or {}
+        focus_windows_doc = await db["focus_windows"].find_one({"_id": "windows"}) or {}
         return {
             "base_echo_rate":       doc.get("base_echo_rate", 10),
             "links":                doc.get("links", {}),
@@ -123,6 +126,8 @@ async def load_data():
             "members":              _sanitize_members(raw_members),
             "active_sessions":      _sanitize_sessions(sessions_doc.get("sessions", {})),
             "daily_session_echoes": doc.get("daily_session_echoes", {}),
+            "session_history":      sess_history_doc.get("history", {}),
+            "focus_windows":        focus_windows_doc.get("windows", {}),
         }
     else:
         if os.path.exists(DATA_FILE):
@@ -136,6 +141,8 @@ async def load_data():
             "members": [],
             "active_sessions": {},
             "daily_session_echoes": {},
+            "session_history": {},
+            "focus_windows": {},
         }
 
 async def save_data(data):
@@ -162,6 +169,16 @@ async def save_data(data):
             {"$set": {"sessions": data.get("active_sessions", {})}},
             upsert=True
         )
+        await db["session_history"].update_one(
+            {"_id": "log"},
+            {"$set": {"history": data.get("session_history", {})}},
+            upsert=True
+        )
+        await db["focus_windows"].update_one(
+            {"_id": "windows"},
+            {"$set": {"windows": data.get("focus_windows", {})}},
+            upsert=True
+        )
     else:
         with open(DATA_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -174,6 +191,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+_bot_ref = bot  # global ref for phantom_alert_task
 
 # ── HELPERS ───────────────────────────────────────────────────────
 def is_admin(interaction: discord.Interaction) -> bool:
@@ -627,7 +645,7 @@ async def _start_session(interaction: discord.Interaction, task: str, session_ty
     vc_note = f"\n🎙️ Detected in **{vc_channel}** — VC bonus active!" if in_vc else "\n💡 Join a VC channel for a higher echo rate."
 
     if session_type == "pomodoro":
-        type_note = f"🍅 **POMODORO** — 25 minutes locked."
+        type_note = f"🍅 **POMODORO** — {duration_minutes or 25} minutes locked."
     elif duration_minutes:
         type_note = f"⏱️ **TIMED SESSION** — {duration_minutes} minutes set."
     else:
@@ -778,6 +796,30 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
             data["daily_session_echoes"] = {}
         data["daily_session_echoes"][daily_key] = daily_earned + echo_info["awarded"]
 
+        # ── Save to session history for analytics ─────────────────────
+        tz       = pytz.timezone(TIMEZONE)
+        now_dt   = datetime.now(tz)
+        date_key = now_dt.strftime("%m/%d")
+        hour_key = now_dt.hour  # 0-23, used for prime time detection
+
+        if "session_history" not in data:
+            data["session_history"] = {}
+        if uid not in data["session_history"]:
+            data["session_history"][uid] = []
+
+        history_entry = {
+            "date":             date_key,
+            "hour":             hour_key,
+            "task":             sess.get("task", ""),
+            "session_type":     sess.get("session_type", "study"),
+            "duration_seconds": duration_seconds,
+            "awarded":          echo_info["awarded"],
+            "in_vc":            sess.get("in_vc", False),
+        }
+        data["session_history"][uid].append(history_entry)
+        # Keep last 90 entries per user
+        data["session_history"][uid] = data["session_history"][uid][-90:]
+
         # Remove active session
         del data["active_sessions"][uid]
         await save_data(data)
@@ -894,51 +936,227 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
         await focus_ch.send(embed=log_embed)
 
 
-@tree.command(name="sessions", description="View your focus session stats")
+@tree.command(name="sessions", description="View your session stats and weekly analytics")
 async def sessions_cmd(interaction: discord.Interaction):
     data      = await load_data()
     uid       = str(interaction.user.id)
     shadow_id = get_shadow_id(uid, data)
 
     if not shadow_id:
-        await interaction.response.send_message(
-            embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first.", color=0xE63946)
-        )
+        await interaction.response.send_message(embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first.", color=0xE63946))
         return
 
     member = get_member(shadow_id, data)
     if not member:
-        await interaction.response.send_message(
-            embed=make_embed("▲ NOT FOUND", "No member record found.", color=0xE63946)
-        )
+        await interaction.response.send_message(embed=make_embed("▲ NOT FOUND", "No member record found.", color=0xE63946))
         return
 
-    sg_count  = member.get("badges", {}).get("shadow_grind", 0)
+    codename   = member.get("codename", shadow_id)
+    sg_count   = member.get("badges", {})
+    if isinstance(sg_count, str):
+        try: sg_count = json.loads(sg_count)
+        except: sg_count = {}
+    sg_count   = sg_count.get("shadow_grind", 0) if isinstance(sg_count, dict) else 0
     echo_count = int(member.get("echoCount", 0))
     today      = today_str()
     daily_key  = f"{uid}_{today}"
     daily_sess = data.get("daily_session_echoes", {}).get(daily_key, 0)
 
+    # ── Session history analytics ──────────────────────────────────
+    history = data.get("session_history", {}).get(uid, [])
+
+    # Last 7 days
+    tz = pytz.timezone(TIMEZONE)
+    now_dt = datetime.now(tz)
+    week_dates = set()
+    for i in range(7):
+        d = now_dt - __import__("datetime").timedelta(days=i)
+        week_dates.add(d.strftime("%m/%d"))
+
+    week_sessions  = [s for s in history if s.get("date") in week_dates]
+    total_secs     = sum(s.get("duration_seconds", 0) for s in week_sessions)
+    total_echoes   = sum(s.get("awarded", 0) for s in week_sessions)
+    total_sessions = len(week_sessions)
+    vc_sessions    = sum(1 for s in week_sessions if s.get("in_vc"))
+
+    # ── Prime productivity window ──────────────────────────────────
+    if history:
+        from collections import Counter
+        hour_counts = Counter(s.get("hour", 0) for s in history)
+        peak_hour   = hour_counts.most_common(1)[0][0]
+        def fmt_hour(h):
+            suffix = "AM" if h < 12 else "PM"
+            h12    = h % 12 or 12
+            return f"{h12}:00 {suffix}"
+        prime_window = f"{fmt_hour(peak_hour)} – {fmt_hour((peak_hour + 1) % 24)}"
+    else:
+        prime_window = "Not enough data yet"
+
+    # ── In-session vs out-of-session todo completion ───────────────
+    session_dates = {s.get("date") for s in week_sessions}
+    todos_data    = data.get("todos", {}).get(uid)
+    if isinstance(todos_data, dict):
+        dates_map = todos_data.get("dates", {})
+        in_sess_done = out_sess_done = in_sess_total = out_sess_total = 0
+        for date_k, todos in dates_map.items():
+            if date_k not in week_dates:
+                continue
+            for t in todos:
+                if date_k in session_dates:
+                    in_sess_total += 1
+                    if t.get("done"): in_sess_done += 1
+                else:
+                    out_sess_total += 1
+                    if t.get("done"): out_sess_done += 1
+        in_pct  = f"{round(in_sess_done/in_sess_total*100)}%" if in_sess_total else "N/A"
+        out_pct = f"{round(out_sess_done/out_sess_total*100)}%" if out_sess_total else "N/A"
+    else:
+        in_pct = out_pct = "N/A"
+
+    # ── Active session note ────────────────────────────────────────
     active = data["active_sessions"].get(uid)
     active_note = ""
     if active:
         elapsed     = int(time_module.time() - active["start_time"])
-        active_note = f"\n\n🔴 **Active session:** {active['task']} · {format_duration(elapsed)} elapsed"
+        active_note = f"\n\n🔴 **Active:** {active['task']} · {format_duration(elapsed)} elapsed"
+
+    # ── Focus window setting ───────────────────────────────────────
+    fw = data.get("focus_windows", {}).get(uid)
+    if fw:
+        fw_note = f"\n🔔 **Phantom Alert:** {fw['hour']:02d}:{fw['minute']:02d} daily (15 min warning)"
+    else:
+        fw_note = "\n🔔 **Phantom Alert:** Not set — use `/setfocuswindow` to enable"
+
+    hours_str = f"{total_secs // 3600}h {(total_secs % 3600) // 60}m"
 
     embed = make_embed(
-        f"◈ {member.get('codename', shadow_id)}'s SESSION PROFILE",
-        f"**Echo Resonance:** {echo_count:,}\n"
-        f"**Session echoes today:** {daily_sess}/{DAILY_SESSION_CAP}\n"
-        f"**Shadow Grind badges:** {'🏅 × ' + str(sg_count) if sg_count else 'None yet — hit 7h in a single session!'}"
-        f"{active_note}",
+        f"📊 {codename} · SESSION ANALYTICS",
+        f"**This week:** {total_sessions} sessions · {hours_str} · {total_echoes} echoes"
+        f"{'  ·  🎙️ ' + str(vc_sessions) + ' in VC' if vc_sessions else ''}"
+        f"{active_note}{fw_note}",
         color=0xA855F7
     )
     embed.add_field(
+        name="🎯 Task Completion",
+        value=f"On session days: **{in_pct}**\nOff session days: **{out_pct}**",
+        inline=True
+    )
+    embed.add_field(
+        name="⚡ Prime Window",
+        value=prime_window,
+        inline=True
+    )
+    embed.add_field(
+        name="🏅 Shadow Grind",
+        value=f"{'🏅 × ' + str(sg_count) if sg_count else 'None yet — hit 7h in one session!'}",
+        inline=True
+    )
+    embed.add_field(
         name="Echo Structure",
-        value=f"3 echoes/hr · 3h +2 · 5h +3 · 7h +5 🏆\nDaily cap: {DAILY_SESSION_CAP} echoes",
+        value=f"3/hr · 3h +2 · 5h +3 · 7h +5 🏆 · Cap: {DAILY_SESSION_CAP}/day\nToday: **{daily_sess}/{DAILY_SESSION_CAP}**",
         inline=False
     )
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · SESSION INTELLIGENCE")
     await interaction.response.send_message(embed=embed)
+
+
+# ── /setfocuswindow ───────────────────────────────────────────────
+@tree.command(name="setfocuswindow", description="Set your daily focus window — bot pings you 15 min before it starts")
+@app_commands.describe(
+    hour="Hour in 24h format (0–23)",
+    minute="Minute (0 or 30)"
+)
+async def setfocuswindow(interaction: discord.Interaction, hour: int, minute: int = 0):
+    uid = str(interaction.user.id)
+    if not (0 <= hour <= 23) or minute not in (0, 15, 30, 45):
+        await interaction.response.send_message(
+            embed=make_embed("▲ INVALID TIME", "Hour must be 0–23. Minute must be 0, 15, 30, or 45.", color=0xE63946)
+        )
+        return
+
+    data = await load_data()
+    if "focus_windows" not in data:
+        data["focus_windows"] = {}
+
+    data["focus_windows"][uid] = {"hour": hour, "minute": minute}
+    await save_data(data)
+
+    def fmt_h(h, m):
+        suffix = "AM" if h < 12 else "PM"
+        h12    = h % 12 or 12
+        return f"{h12}:{m:02d} {suffix}"
+
+    # Alert fires 15 min before
+    alert_total = hour * 60 + minute - 15
+    if alert_total < 0:
+        alert_total += 1440
+    alert_h, alert_m = divmod(alert_total, 60)
+
+    await interaction.response.send_message(
+        embed=make_embed(
+            "🔔 PHANTOM ALERT SET",
+            f"Your focus window is locked in at **{fmt_h(hour, minute)}** daily.\n"
+            f"You'll be pinged at **{fmt_h(alert_h, alert_m)}** — 15 minutes before it begins.\n\n"
+            f"*Use `/setfocuswindow` again to update anytime.*",
+            color=0xA855F7
+        ).set_footer(text="☽ SHADOWSEEKERS ORDER · PHANTOM ALERT SYSTEM")
+    )
+
+
+# ── PHANTOM ALERT TASK ────────────────────────────────────────────
+@tasks.loop(minutes=1)
+async def phantom_alert_task():
+    """Every minute: check if any operative's focus window alert should fire."""
+    tz     = pytz.timezone(TIMEZONE)
+    now_dt = datetime.now(tz)
+    now_h  = now_dt.hour
+    now_m  = now_dt.minute
+
+    try:
+        data = await load_data()
+    except Exception:
+        return
+
+    windows = data.get("focus_windows", {})
+    if not windows:
+        return
+
+    for uid, fw in windows.items():
+        fw_h = fw.get("hour", 0)
+        fw_m = fw.get("minute", 0)
+
+        # Alert fires 15 min before focus window
+        alert_total = fw_h * 60 + fw_m - 15
+        if alert_total < 0:
+            alert_total += 1440
+        alert_h, alert_m = divmod(alert_total, 60)
+
+        if now_h == alert_h and now_m == alert_m:
+            def fmt_h(h, m):
+                suffix = "AM" if h < 12 else "PM"
+                h12    = h % 12 or 12
+                return f"{h12}:{m:02d} {suffix}"
+
+            # Find the member's guild and DM them
+            for guild in _bot_ref.guilds:
+                member_obj = guild.get_member(int(uid))
+                if member_obj:
+                    try:
+                        embed = discord.Embed(
+                            title="👻 PHANTOM ALERT — FOCUS WINDOW IN 15 MIN",
+                            description=(
+                                f"Your focus window begins at **{fmt_h(fw_h, fw_m)}**.\n\n"
+                                f"Prepare your workspace. Clear distractions.\n"
+                                f"Use `/study <task>` or `/pomodoro <task>` when you're ready to lock in.\n\n"
+                                f"*The shadow doesn't wait.*"
+                            ),
+                            color=0xA855F7
+                        )
+                        embed.set_footer(text="☽ SHADOWSEEKERS ORDER · PHANTOM ALERT SYSTEM")
+                        await member_obj.send(embed=embed)
+                    except Exception as e:
+                        print(f"[PHANTOM ALERT] Could not DM uid={uid}: {e}")
+                    break
 
 # ══════════════════════════════════════════════════════════════════
 #  VC TRACKING
@@ -1990,8 +2208,10 @@ async def on_ready():
     daily_echo_task.start()
     session_ticker.start()
     ai_mission_task.start()
+    phantom_alert_task.start()
     print(f"[SHADOW BOT] Daily task scheduled at {EOD_HOUR}:{EOD_MINUTE:02d} {TIMEZONE}")
     print(f"[SHADOW BOT] Session ticker started")
     print("[SHADOW BOT] AI Mission Generator started")
+    print("[SHADOW BOT] Phantom Alert task started")
 
 bot.run(TOKEN)
