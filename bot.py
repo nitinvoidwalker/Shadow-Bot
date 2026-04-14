@@ -219,9 +219,9 @@ def format_duration(seconds: int) -> str:
     m = (seconds % 3600) // 60
     s = seconds % 60
     if h > 0:
-        return f"{h}h {m}m"
+        return f"{h}h {m}min"
     elif m > 0:
-        return f"{m}m {s}s"
+        return f"{m}min {s}s"
     return f"{s}s"
 
 def make_progress_bar(elapsed_seconds: int, total_seconds: int, width: int = 10) -> str:
@@ -633,7 +633,7 @@ async def _start_session(interaction: discord.Interaction, task: str, session_ty
 @tree.command(name="study", description="Start a focus session — open-ended or with a timer")
 @app_commands.describe(
     task="What are you working on?",
-    duration="Optional timer in minutes (e.g. 60 for 1 hour). Leave blank for open-ended."
+    duration="Timer in minutes (e.g. 30 = 30 minutes, 60 = 1 hour). Leave blank for open-ended."
 )
 async def study(interaction: discord.Interaction, task: str, duration: int = None):
     if duration is not None and duration < 1:
@@ -682,45 +682,53 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
     # Acknowledge immediately so Discord doesn't time out
     await interaction.response.defer()
 
-    now              = time_module.time()
-    duration_seconds = int(now - sess["start_time"])
-    today            = today_str()
+    try:
+        now              = time_module.time()
+        duration_seconds = int(now - sess["start_time"])
+        today            = today_str()
 
-    # Get daily earned so far
-    daily_key     = f"{uid}_{today}"
-    daily_earned  = data.get("daily_session_echoes", {}).get(daily_key, 0)
+        # Get daily earned so far
+        daily_key     = f"{uid}_{today}"
+        daily_earned  = data.get("daily_session_echoes", {}).get(daily_key, 0)
 
-    echo_info = calculate_session_echoes(duration_seconds, daily_earned)
+        echo_info = calculate_session_echoes(duration_seconds, daily_earned)
 
-    # Award echoes
-    sg_count = 0
-    new_badge = False
-    for i, m in enumerate(data["members"]):
-        if m["shadowId"] == shadow_id:
-            old = int(m.get("echoCount", 0))
-            data["members"][i]["echoCount"] = old + echo_info["awarded"]
+        # Award echoes
+        sg_count = 0
+        new_badge = False
+        for i, m in enumerate(data["members"]):
+            if m["shadowId"] == shadow_id:
+                old = int(m.get("echoCount", 0))
+                data["members"][i]["echoCount"] = old + echo_info["awarded"]
 
-            # Badge tracking — Shadow Grind
-            badges   = data["members"][i].get("badges", {})
-            sg_count = badges.get("shadow_grind", 0)
-            new_badge = echo_info["hours"] >= MAX_SESSION_HOURS
-            if new_badge:
-                sg_count += 1
-                badges["shadow_grind"] = sg_count
-                data["members"][i]["badges"] = badges
-            break
+                # Badge tracking — Shadow Grind
+                badges   = data["members"][i].get("badges", {})
+                sg_count = badges.get("shadow_grind", 0)
+                new_badge = echo_info["hours"] >= MAX_SESSION_HOURS
+                if new_badge:
+                    sg_count += 1
+                    badges["shadow_grind"] = sg_count
+                    data["members"][i]["badges"] = badges
+                break
 
-    # Update daily cap tracker
-    if "daily_session_echoes" not in data:
-        data["daily_session_echoes"] = {}
-    data["daily_session_echoes"][daily_key] = daily_earned + echo_info["awarded"]
+        # Update daily cap tracker
+        if "daily_session_echoes" not in data:
+            data["daily_session_echoes"] = {}
+        data["daily_session_echoes"][daily_key] = daily_earned + echo_info["awarded"]
 
-    # Remove active session
-    del data["active_sessions"][uid]
-    await save_data(data)
+        # Remove active session
+        del data["active_sessions"][uid]
+        await save_data(data)
 
-    # Remove live message
-    _session_messages.pop(uid, None)
+        # Remove live message
+        _session_messages.pop(uid, None)
+
+    except Exception as e:
+        print(f"[ENDSESSION ERROR] uid={uid}: {e}")
+        await interaction.followup.send(
+            embed=make_embed("▲ SESSION END ERROR", "Something went wrong ending your session. Please try again.", color=0xE63946)
+        )
+        return
 
     # ── Resolve proof link ─────────────────────────────────────────
     # Priority: uploaded attachment > URL in proof text > plain text
