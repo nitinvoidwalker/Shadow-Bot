@@ -684,7 +684,7 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
 
     try:
         now              = time_module.time()
-        duration_seconds = int(now - sess["start_time"])
+        duration_seconds = int(now - float(sess["start_time"]))
         today            = today_str()
 
         # Get daily earned so far
@@ -724,9 +724,16 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
         _session_messages.pop(uid, None)
 
     except Exception as e:
-        print(f"[ENDSESSION ERROR] uid={uid}: {e}")
+        import traceback
+        err_detail = traceback.format_exc()
+        print(f"[ENDSESSION ERROR] uid={uid}: {e}\n{err_detail}")
+        short_err = type(e).__name__ + ": " + str(e)[:300]
         await interaction.followup.send(
-            embed=make_embed("▲ SESSION END ERROR", "Something went wrong ending your session. Please try again.", color=0xE63946)
+            embed=make_embed(
+                "▲ SESSION END ERROR",
+                f"Something went wrong ending your session.\n```{short_err}```\nPlease screenshot this and report it.",
+                color=0xE63946
+            )
         )
         return
 
