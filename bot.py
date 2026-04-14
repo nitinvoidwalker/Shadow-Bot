@@ -44,6 +44,7 @@ from datetime import datetime, time, date
 import pytz
 import motor.motor_asyncio
 import time as time_module
+from ai_missions import setup_ai_missions, ai_mission_task
 
 # ── CONFIG ────────────────────────────────────────────────────────
 TOKEN        = os.getenv("DISCORD_TOKEN")
@@ -92,6 +93,21 @@ def _sanitize_members(raw: list) -> list:
             result.append(m)
     return result
 
+def _sanitize_sessions(raw: dict) -> dict:
+    """Ensure every session value is a dict, not a JSON string (MongoDB serialization bug)."""
+    result = {}
+    for uid, sess in raw.items():
+        if isinstance(sess, str):
+            try:
+                parsed = json.loads(sess)
+                if isinstance(parsed, dict):
+                    result[uid] = parsed
+            except Exception:
+                pass  # drop malformed session
+        elif isinstance(sess, dict):
+            result[uid] = sess
+    return result
+
 async def load_data():
     db = get_db()
     if db is not None:
@@ -105,7 +121,7 @@ async def load_data():
             "pending_links":        doc.get("pending_links", {}),
             "todos":                doc.get("todos", {}),
             "members":              _sanitize_members(raw_members),
-            "active_sessions":      sessions_doc.get("sessions", {}),
+            "active_sessions":      _sanitize_sessions(sessions_doc.get("sessions", {})),
             "daily_session_echoes": doc.get("daily_session_echoes", {}),
         }
     else:
@@ -1943,5 +1959,9 @@ async def on_ready():
     session_ticker.start()
     print(f"[SHADOW BOT] Daily task scheduled at {EOD_HOUR}:{EOD_MINUTE:02d} {TIMEZONE}")
     print(f"[SHADOW BOT] Session ticker started")
+
+    setup_ai_missions(bot, tree)
+    ai_mission_task.start()
+    print("[SHADOW BOT] AI Mission Generator started")
 
 bot.run(TOKEN)
