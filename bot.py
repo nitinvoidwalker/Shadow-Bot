@@ -218,7 +218,20 @@ def today_str() -> str:
 def get_active_date(uid: str, data: dict) -> str:
     entry = data["todos"].get(uid)
     if isinstance(entry, dict):
-        return entry.get("active_date", today_str())
+        stored = entry.get("active_date", today_str())
+        # If stored date is in the past, reset to today automatically
+        today = today_str()
+        try:
+            tz = pytz.timezone(TIMEZONE)
+            current_year = datetime.now(tz).year
+            stored_dt = datetime.strptime(f"{stored}/{current_year}", "%m/%d/%Y")
+            today_dt  = datetime.strptime(f"{today}/{current_year}", "%m/%d/%Y")
+            if stored_dt.date() < today_dt.date():
+                data["todos"][uid]["active_date"] = today
+                return today
+        except Exception:
+            pass
+        return stored
     return today_str()
 
 def get_todos_for_date(uid: str, date_key: str, data: dict) -> list:
@@ -1243,49 +1256,26 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             dm_embed = make_embed(status_title, dm_desc, color=0xA855F7)
             dm_embed.set_author(name=f"Operative: {codename}")
             dm_embed.set_footer(text=f"Joined {after.channel.name} · VC bonus active")
-            try:
-                await member.send(embed=dm_embed)
-            except Exception:
-                pass
 
-            # Post note in focus-log (codename only, no mention)
+            # Ping in focus-log channel instead of DM
             focus_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
             if focus_ch:
-                log_embed = make_embed(
-                    "SEEKER IDENTIFIED IN VC",
-                    f"**{codename}** detected in **{after.channel.name}** · {format_duration(elapsed)} into session\n"
-                    f"VC bonus now active — keep grinding.",
-                    color=0x6B6B9A
-                )
-                log_embed.set_author(name=f"Operative: {codename}")
-                await focus_ch.send(embed=log_embed)
+                await focus_ch.send(content=member.mention, embed=dm_embed)
             return
 
-        # No active session — DM the user and post in focus-log
-        try:
+        # No active session — ping in focus-log channel
+        focus_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
+        if focus_ch:
             prompt_embed = make_embed(
-                "YOU ENTERED THE VOID",
-                f"You joined **{after.channel.name}**.\n\n"
+                "OPERATIVE ENTERED THE VOID",
+                f"**{codename}** joined **{after.channel.name}**\n\n"
                 f"Start a session to earn echoes while you're here.\n"
                 f"Use `/study <task>` or `/pomodoro <task>` to lock in.",
                 color=0x6B6B9A
             )
+            prompt_embed.set_author(name=f"Operative: {codename}")
             prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
-            await member.send(embed=prompt_embed)
-        except Exception:
-            pass
-
-        focus_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
-        if focus_ch:
-            embed = make_embed(
-                "OPERATIVE ENTERED THE VOID",
-                f"**{codename}** joined **{after.channel.name}**\n\n"
-                f"Use `/study <task>` or `/pomodoro <task>` to lock in and earn echoes.\n"
-                f"VC detected — active rate applies.",
-                color=0x6B6B9A
-            )
-            embed.set_author(name=f"Operative: {codename}")
-            await focus_ch.send(embed=embed)
+            await focus_ch.send(content=member.mention, embed=prompt_embed)
 
     elif left:
         # Log VC time for ALL users
