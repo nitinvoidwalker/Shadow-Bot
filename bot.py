@@ -3,6 +3,7 @@
 ║         SHADOW BOT · ShadowSeekers Order             ║
 ║   Objective tracking · Echo management · GAS sync    ║
 ║   Study sessions · VC tracking · Shadow Grind badge  ║
+║   Exam countdown · /exam command                     ║
 ╚══════════════════════════════════════════════════════╝
 
 COMMANDS (all slash commands):
@@ -26,6 +27,10 @@ COMMANDS (all slash commands):
   /echoes                      — reveal your echo count + rank
   /leaderboard                 — top 10 operatives by echo power
   /link <shadow_id> <n>        — bind your identity to a Shadow ID
+  /exam add <name> [date]      — add an exam to your profile (auto-fetches date if blank)
+  /exam list                   — view all your upcoming exams with countdowns
+  /exam remove <number>        — remove an exam
+  /exams                       — view server-wide upcoming exams
 
 COMMAND ONLY (HIGH CLEARANCE):
   /approve @operative  — authorize an identity bind request
@@ -41,10 +46,11 @@ import json
 import os
 import asyncio
 import aiohttp
-from datetime import datetime, time, date
+from datetime import datetime, time, date, timedelta
 import pytz
 import motor.motor_asyncio
 import time as time_module
+import re
 from ai_missions import setup_ai_missions, ai_mission_task
 
 # ── CONFIG ────────────────────────────────────────────────────────
@@ -91,13 +97,13 @@ def _sanitize_members(raw: list) -> list:
                 if isinstance(parsed, dict):
                     result.append(parsed)
             except Exception:
-                pass  # skip malformed entries
+                pass
         elif isinstance(m, dict):
             result.append(m)
     return result
 
 def _sanitize_sessions(raw: dict) -> dict:
-    """Ensure every session value is a dict, not a JSON string (MongoDB serialization bug)."""
+    """Ensure every session value is a dict, not a JSON string."""
     result = {}
     for uid, sess in raw.items():
         if isinstance(sess, str):
@@ -106,7 +112,7 @@ def _sanitize_sessions(raw: dict) -> dict:
                 if isinstance(parsed, dict):
                     result[uid] = parsed
             except Exception:
-                pass  # drop malformed session
+                pass
         elif isinstance(sess, dict):
             result[uid] = sess
     return result
@@ -120,6 +126,7 @@ async def load_data():
         raw_members  = members_doc.get("members", [])
         sess_history_doc = await db["session_history"].find_one({"_id": "log"}) or {}
         focus_windows_doc = await db["focus_windows"].find_one({"_id": "windows"}) or {}
+        exams_doc    = await db["exams"].find_one({"_id": "list"}) or {}
         return {
             "base_echo_rate":       doc.get("base_echo_rate", 10),
             "links":                doc.get("links", {}),
@@ -130,11 +137,15 @@ async def load_data():
             "daily_session_echoes": doc.get("daily_session_echoes", {}),
             "session_history":      sess_history_doc.get("history", {}),
             "focus_windows":        focus_windows_doc.get("windows", {}),
+            "exams":                exams_doc.get("exams", {}),
         }
     else:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, "r") as f:
-                return json.load(f)
+                raw = json.load(f)
+                if "exams" not in raw:
+                    raw["exams"] = {}
+                return raw
         return {
             "base_echo_rate": 10,
             "links": {},
@@ -145,6 +156,7 @@ async def load_data():
             "daily_session_echoes": {},
             "session_history": {},
             "focus_windows": {},
+            "exams": {},
         }
 
 async def save_data(data):
@@ -181,6 +193,11 @@ async def save_data(data):
             {"$set": {"windows": data.get("focus_windows", {})}},
             upsert=True
         )
+        await db["exams"].update_one(
+            {"_id": "list"},
+            {"$set": {"exams": data.get("exams", {})}},
+            upsert=True
+        )
     else:
         with open(DATA_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -193,7 +210,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
-_bot_ref = bot  # global ref for phantom_alert_task
+_bot_ref = bot
 
 # ── HELPERS ───────────────────────────────────────────────────────
 def is_admin(interaction: discord.Interaction) -> bool:
@@ -219,7 +236,6 @@ def get_active_date(uid: str, data: dict) -> str:
     entry = data["todos"].get(uid)
     if isinstance(entry, dict):
         stored = entry.get("active_date", today_str())
-        # If stored date is in the past, reset to today automatically
         today = today_str()
         try:
             tz = pytz.timezone(TIMEZONE)
@@ -296,11 +312,6 @@ def make_progress_bar(elapsed_seconds: int, total_seconds: int, width: int = 10)
 
 # ── SESSION ECHO CALCULATOR ───────────────────────────────────────
 def calculate_session_echoes(duration_seconds: int, daily_earned_so_far: int) -> dict:
-    """
-    Returns echoes earned, milestones hit, and breakdown.
-    3 echoes per completed hour + milestone bonuses.
-    Hard cap: DAILY_SESSION_CAP total per day.
-    """
     hours_completed = int(duration_seconds // 3600)
     hours_completed = min(hours_completed, MAX_SESSION_HOURS)
 
@@ -314,7 +325,6 @@ def calculate_session_echoes(duration_seconds: int, daily_earned_so_far: int) ->
             milestones_hit.append((milestone_hr, bonus))
 
     total = base_echoes + bonus_echoes
-    # Apply daily cap
     remaining_cap = max(0, DAILY_SESSION_CAP - daily_earned_so_far)
     awarded = min(total, remaining_cap)
 
@@ -366,7 +376,6 @@ async def push_to_gas(data: dict):
     return False
 
 async def push_proof_to_gas(session_data: dict) -> bool:
-    """Push session proof (image link + metadata) to Google Sheets via GAS."""
     try:
         payload = json.dumps({
             "action": "submitProof",
@@ -416,8 +425,9 @@ async def create_member_on_gas(member: dict) -> bool:
     return False
 
 # ── ACTIVE SESSION TIMER LOOP ─────────────────────────────────────
-# Stores: uid -> {task, start_time, session_type, in_vc, channel_id, message_id, guild_id, pomodoro_end}
-_session_messages = {}   # uid -> discord.Message (for editing)
+# FIX: Store message objects in memory; always edit in-place, never send new messages
+# from the ticker. The ticker only edits. If message is gone, clear the ref.
+_session_messages = {}   # uid -> discord.Message
 
 @tasks.loop(seconds=20)
 async def session_ticker():
@@ -427,17 +437,12 @@ async def session_ticker():
 
     for uid, sess in list(data["active_sessions"].items()):
         try:
-            guild   = bot.get_guild(int(sess["guild_id"]))
-            channel = guild.get_channel(int(sess["channel_id"])) if guild else None
-            if not channel:
-                continue
-
             elapsed  = int(now - sess["start_time"])
             is_pomo  = sess["session_type"] == "pomodoro"
             pomo_end = sess.get("pomodoro_end")
             timer_total = sess.get("timer_total")
 
-            # Timed session (pomodoro OR study with duration)
+            # ── Timed session (pomodoro OR study with duration) ──
             if pomo_end and timer_total:
                 remaining = max(0, int(pomo_end - now))
                 bar       = make_progress_bar(timer_total - remaining, timer_total)
@@ -471,7 +476,7 @@ async def session_ticker():
                 embed.set_author(name=f"Operative: {sess.get('codename', uid)}")
 
             else:
-                # Open-ended study session (no timer)
+                # ── FIX: Open-ended study session — full rich embed every tick ──
                 hours_done = elapsed // 3600
                 next_milestone = None
                 for mhr in sorted(MILESTONE_BONUSES.keys()):
@@ -489,31 +494,30 @@ async def session_ticker():
                     milestone_note = "\n🏆 **MAX SESSION REACHED** — Submit proof to claim all echoes."
 
                 vc_note = " · 🎙️ In VC" if sess.get("in_vc") else ""
+                echoes_so_far = hours_done * ECHO_PER_HOUR
 
                 embed = make_embed(
                     "☽ FOCUS SESSION IN PROGRESS",
                     f"**{sess['task']}**\n\n"
                     f"`[{bar}]` **{format_duration(elapsed)} elapsed**{vc_note}\n"
-                    f"Next hour in: {format_duration(secs_to_next_hr)}\n"
-                    f"Echoes so far: **~{hours_done * ECHO_PER_HOUR}**{milestone_note}\n\n"
+                    f"Next hour milestone in: **{format_duration(secs_to_next_hr)}**\n"
+                    f"Echoes earned so far: **~{echoes_so_far}**{milestone_note}\n\n"
                     f"Use `/endsession` to submit proof and claim echoes.",
                     color=0x7B2FBE
                 )
                 embed.set_author(name=f"Operative: {sess.get('codename', uid)}")
 
-            # Edit existing message if we have it, otherwise send to channel
+            # ── FIX: Only EDIT the existing message — never send new ones ──
             msg = _session_messages.get(uid)
             if msg:
                 try:
                     await msg.edit(embed=embed)
-                except Exception:
-                    # Message gone — send fresh to channel and track it
+                except discord.NotFound:
+                    # Message was deleted — clear ref but don't spam channel
                     _session_messages.pop(uid, None)
-                    try:
-                        new_msg = await channel.send(embed=embed)
-                        _session_messages[uid] = new_msg
-                    except Exception as e:
-                        print(f"[SESSION TICKER] Could not send fresh message uid={uid}: {e}")
+                except Exception as e:
+                    print(f"[SESSION TICKER] Edit failed uid={uid}: {e}")
+            # If no message ref exists, we simply skip — don't spam the channel
 
         except Exception as e:
             print(f"[SESSION TICKER ERROR] uid={uid}: {e}")
@@ -525,7 +529,6 @@ async def run_end_of_day(guild: discord.Guild, announce=True):
     today   = today_str()
     results = []
 
-    # Reset daily session echo counters
     data["daily_session_echoes"] = {}
 
     for discord_id, link in data["links"].items():
@@ -658,7 +661,7 @@ async def _start_session(interaction: discord.Interaction, task: str, session_ty
         "guild_id":     str(interaction.guild_id),
         "shadow_id":    shadow_id,
         "codename":     codename,
-        "pomodoro_end": timer_end,   # reused for custom timer too
+        "pomodoro_end": timer_end,
         "timer_total":  timer_total,
     }
     data["active_sessions"][uid] = session
@@ -689,6 +692,7 @@ async def _start_session(interaction: discord.Interaction, task: str, session_ty
 
     await interaction.response.send_message(embed=embed)
     msg = await interaction.original_response()
+    # FIX: Store the actual message object so ticker can edit it
     _session_messages[uid] = msg
 
     # Post in focus-log channel if different
@@ -755,11 +759,9 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
         )
         return
 
-    # Corrupted session in DB (stored as string instead of dict) — wipe it
     if isinstance(sess, str):
         try:
-            import json as _json
-            sess = _json.loads(sess)
+            sess = json.loads(sess)
             data["active_sessions"][uid] = sess
         except Exception:
             del data["active_sessions"][uid]
@@ -775,7 +777,6 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
         )
         return
 
-    # Acknowledge immediately so Discord doesn't time out
     await interaction.response.defer()
 
     try:
@@ -783,13 +784,11 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
         duration_seconds = int(now - float(sess["start_time"]))
         today            = today_str()
 
-        # Get daily earned so far
         daily_key     = f"{uid}_{today}"
         daily_earned  = data.get("daily_session_echoes", {}).get(daily_key, 0)
 
         echo_info = calculate_session_echoes(duration_seconds, daily_earned)
 
-        # Award echoes
         sg_count = 0
         new_badge = False
         for i, m in enumerate(data["members"]):
@@ -797,7 +796,6 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
                 old = int(m.get("echoCount", 0))
                 data["members"][i]["echoCount"] = old + echo_info["awarded"]
 
-                # Badge tracking — Shadow Grind
                 badges = data["members"][i].get("badges", {})
                 if isinstance(badges, str):
                     try:
@@ -814,16 +812,14 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
                     data["members"][i]["badges"] = badges
                 break
 
-        # Update daily cap tracker
         if "daily_session_echoes" not in data:
             data["daily_session_echoes"] = {}
         data["daily_session_echoes"][daily_key] = daily_earned + echo_info["awarded"]
 
-        # ── Save to session history for analytics ─────────────────────
         tz       = pytz.timezone(TIMEZONE)
         now_dt   = datetime.now(tz)
         date_key = now_dt.strftime("%m/%d")
-        hour_key = now_dt.hour  # 0-23, used for prime time detection
+        hour_key = now_dt.hour
 
         if "session_history" not in data:
             data["session_history"] = {}
@@ -840,14 +836,11 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
             "in_vc":            sess.get("in_vc", False),
         }
         data["session_history"][uid].append(history_entry)
-        # Keep last 90 entries per user
         data["session_history"][uid] = data["session_history"][uid][-90:]
 
-        # Remove active session
         del data["active_sessions"][uid]
         await save_data(data)
 
-        # Remove live message
         _session_messages.pop(uid, None)
 
     except Exception as e:
@@ -864,13 +857,10 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
         )
         return
 
-    # ── Resolve proof link ─────────────────────────────────────────
-    # Priority: uploaded attachment > URL in proof text > plain text
     proof_image_url = None
     proof_display   = proof or ""
 
     if attachment:
-        # Discord CDN link from the uploaded file
         proof_image_url = attachment.url
         proof_display   = attachment.url
     elif proof:
@@ -886,7 +876,6 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
         if is_image_url:
             proof_image_url = proof
 
-    # ── Build result embed ─────────────────────────────────────────
     milestone_lines = ""
     if echo_info["milestones"]:
         milestone_lines = "\n" + "\n".join(
@@ -920,7 +909,6 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
 
     await interaction.followup.send(embed=embed)
 
-    # ── Push to GAS (fire-and-forget, won't block or cause timeout) ─
     sess_data = {
         **sess,
         "duration_seconds": duration_seconds,
@@ -944,7 +932,6 @@ async def endsession(interaction: discord.Interaction, proof: str = None, attach
 
     asyncio.create_task(_background_push())
 
-    # Announce in focus-log + deep-work-logs + general
     focus_ch     = discord.utils.get(interaction.guild.text_channels, name=FOCUS_LOG_CHANNEL)
     deep_work_ch = discord.utils.get(interaction.guild.text_channels, name=DEEP_WORK_LOG_CHANNEL)
     general_ch   = discord.utils.get(interaction.guild.text_channels, name=GENERAL_CHANNEL)
@@ -997,15 +984,13 @@ async def sessions_cmd(interaction: discord.Interaction):
     daily_key  = f"{uid}_{today}"
     daily_sess = data.get("daily_session_echoes", {}).get(daily_key, 0)
 
-    # ── Session history analytics ──────────────────────────────────
     history = data.get("session_history", {}).get(uid, [])
 
-    # Last 7 days
     tz = pytz.timezone(TIMEZONE)
     now_dt = datetime.now(tz)
     week_dates = set()
     for i in range(7):
-        d = now_dt - __import__("datetime").timedelta(days=i)
+        d = now_dt - timedelta(days=i)
         week_dates.add(d.strftime("%m/%d"))
 
     week_sessions  = [s for s in history if s.get("date") in week_dates]
@@ -1014,7 +999,6 @@ async def sessions_cmd(interaction: discord.Interaction):
     total_sessions = len(week_sessions)
     vc_sessions    = sum(1 for s in week_sessions if s.get("in_vc"))
 
-    # ── Prime productivity window ──────────────────────────────────
     if history:
         from collections import Counter
         hour_counts = Counter(s.get("hour", 0) for s in history)
@@ -1027,7 +1011,6 @@ async def sessions_cmd(interaction: discord.Interaction):
     else:
         prime_window = "Not enough data yet"
 
-    # ── In-session vs out-of-session todo completion ───────────────
     session_dates = {s.get("date") for s in week_sessions}
     todos_data    = data.get("todos", {}).get(uid)
     if isinstance(todos_data, dict):
@@ -1048,14 +1031,12 @@ async def sessions_cmd(interaction: discord.Interaction):
     else:
         in_pct = out_pct = "N/A"
 
-    # ── Active session note ────────────────────────────────────────
     active = data["active_sessions"].get(uid)
     active_note = ""
     if active:
         elapsed     = int(time_module.time() - active["start_time"])
         active_note = f"\n\n🔴 **Active:** {active['task']} · {format_duration(elapsed)} elapsed"
 
-    # ── Focus window setting ───────────────────────────────────────
     fw = data.get("focus_windows", {}).get(uid)
     if fw:
         fw_note = f"\n🔔 **Phantom Alert:** {fw['hour']:02d}:{fw['minute']:02d} daily (15 min warning)"
@@ -1121,7 +1102,6 @@ async def setfocuswindow(interaction: discord.Interaction, hour: int, minute: in
         h12    = h % 12 or 12
         return f"{h12}:{m:02d} {suffix}"
 
-    # Alert fires 15 min before
     alert_total = hour * 60 + minute - 15
     if alert_total < 0:
         alert_total += 1440
@@ -1141,7 +1121,6 @@ async def setfocuswindow(interaction: discord.Interaction, hour: int, minute: in
 # ── PHANTOM ALERT TASK ────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def phantom_alert_task():
-    """Every minute: check if any operative's focus window alert should fire."""
     tz     = pytz.timezone(TIMEZONE)
     now_dt = datetime.now(tz)
     now_h  = now_dt.hour
@@ -1160,7 +1139,6 @@ async def phantom_alert_task():
         fw_h = fw.get("hour", 0)
         fw_m = fw.get("minute", 0)
 
-        # Alert fires 15 min before focus window
         alert_total = fw_h * 60 + fw_m - 15
         if alert_total < 0:
             alert_total += 1440
@@ -1172,7 +1150,6 @@ async def phantom_alert_task():
                 h12    = h % 12 or 12
                 return f"{h12}:{m:02d} {suffix}"
 
-            # Find the member's guild and DM them
             for guild in _bot_ref.guilds:
                 member_obj = guild.get_member(int(uid))
                 if member_obj:
@@ -1194,15 +1171,14 @@ async def phantom_alert_task():
                     break
 
 # ══════════════════════════════════════════════════════════════════
-#  VC TRACKING
+#  VC TRACKING  (FIXED)
 # ══════════════════════════════════════════════════════════════════
 
-# In-memory VC join timestamps for time tracking: uid -> join_epoch
 _vc_join_times: dict = {}
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    """Detect VC joins/leaves — track time, DM ping user, show timer if session running."""
+    """Detect VC joins/leaves — track time, ping user, show timer if session running."""
     if member.bot:
         return
 
@@ -1214,23 +1190,24 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     left   = before.channel is not None and after.channel is None
 
     if joined:
-        # Track VC join time for ALL users (linked or not)
         _vc_join_times[uid] = now
 
         shadow_id = get_shadow_id(uid, data)
-        if not shadow_id:
-            return  # Not linked — time tracked, nothing else to do
-
-        m_obj    = get_member(shadow_id, data)
-        codename = m_obj.get("codename", shadow_id) if m_obj else shadow_id
+        # FIX: Always ping in focus-log/general, whether linked or not
+        # Just use display name if not linked
+        if shadow_id:
+            m_obj    = get_member(shadow_id, data)
+            codename = m_obj.get("codename", shadow_id) if m_obj else shadow_id
+        else:
+            codename = member.display_name
 
         # Update session VC status if session is active
-        if uid in data["active_sessions"]:
+        if uid in data["active_sessions"] and shadow_id:
             data["active_sessions"][uid]["in_vc"]      = True
             data["active_sessions"][uid]["vc_channel"] = after.channel.name
             await save_data(data)
 
-            # Immediately force-edit the live timer message to show VC bonus
+            # Force-edit the live timer message to show VC bonus
             live_msg = _session_messages.get(uid)
             if live_msg:
                 try:
@@ -1239,14 +1216,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     bar       = make_progress_bar(el % 3600, 3600)
                     quick_embed = make_embed(
                         "☽ FOCUS SESSION IN PROGRESS",
-                        f"**{sess_snap['task']}**
-
-"
-                        f"`[{bar}]` **{format_duration(el)} elapsed** · 🎙️ In VC
-
-"
-                        f"VC bonus now active — keep grinding.
-"
+                        f"**{sess_snap['task']}**\n\n"
+                        f"`[{bar}]` **{format_duration(el)} elapsed** · 🎙️ In VC\n\n"
+                        f"VC bonus now active — keep grinding.\n"
                         f"Use `/endsession` to submit proof and claim echoes.",
                         color=0xA855F7
                     )
@@ -1294,29 +1266,47 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 sess_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
             if sess_ch:
                 await sess_ch.send(content=member.mention, embed=dm_embed)
-            else:
-                print(f"[VC JOIN] No channel found to ping uid={uid}")
             return
 
-        # No active session — ping in focus-log or general channel
+        # ── FIX: VC join ping works for ALL members (linked or not) ──
         ping_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
         if not ping_ch:
             ping_ch = discord.utils.get(member.guild.text_channels, name=GENERAL_CHANNEL)
-        print(f"[VC JOIN] uid={uid} codename={codename} ping_ch={ping_ch}")
+
+        print(f"[VC JOIN] uid={uid} codename={codename} linked={shadow_id is not None} ping_ch={ping_ch}")
+
         if ping_ch:
-            prompt_embed = make_embed(
-                "OPERATIVE ENTERED THE VOID",
-                f"**{codename}** joined **{after.channel.name}**\n\n"
-                f"Start a session to earn echoes while you're here.\n"
-                f"Use `/study <task>` or `/pomodoro <task>` to lock in.",
-                color=0x6B6B9A
-            )
-            prompt_embed.set_author(name=f"Operative: {codename}")
-            prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
-            await ping_ch.send(content=member.mention, embed=prompt_embed)
+            if shadow_id:
+                # Linked operative — show full prompt with session start CTA
+                prompt_embed = make_embed(
+                    "☽ OPERATIVE ENTERED THE VOID",
+                    f"**{codename}** joined **{after.channel.name}**\n\n"
+                    f"Start a session to earn echoes while you're here.\n"
+                    f"Use `/study <task>` or `/pomodoro <task>` to lock in.",
+                    color=0x6B6B9A
+                )
+                prompt_embed.set_author(
+                    name=f"Operative: {codename}",
+                    icon_url=member.display_avatar.url if member.display_avatar else None
+                )
+                prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
+                await ping_ch.send(content=member.mention, embed=prompt_embed)
+            else:
+                # Unlinked member — simple join ping
+                prompt_embed = make_embed(
+                    "🎙️ MEMBER JOINED VC",
+                    f"**{codename}** joined **{after.channel.name}**\n\n"
+                    f"Link your Shadow ID with `/link <shadow_id> <name>` to earn echoes.",
+                    color=0x4B4B6B
+                )
+                prompt_embed.set_author(
+                    name=codename,
+                    icon_url=member.display_avatar.url if member.display_avatar else None
+                )
+                prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
+                await ping_ch.send(embed=prompt_embed)
 
     elif left:
-        # Log VC time for ALL users
         join_time = _vc_join_times.pop(uid, None)
         if join_time:
             vc_seconds = int(now - join_time)
@@ -1324,7 +1314,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 data["vc_time"] = {}
             data["vc_time"][uid] = data["vc_time"].get(uid, 0) + vc_seconds
 
-        # Update session VC status
         if uid in data["active_sessions"]:
             data["active_sessions"][uid]["in_vc"]      = False
             data["active_sessions"][uid]["vc_channel"] = ""
@@ -1332,7 +1321,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         await save_data(data)
 
 # ══════════════════════════════════════════════════════════════════
-#  SLASH COMMANDS (existing)
+#  SLASH COMMANDS
 # ══════════════════════════════════════════════════════════════════
 
 # ── /todo ─────────────────────────────────────────────────────────
@@ -1364,7 +1353,6 @@ async def todo_date(interaction: discord.Interaction, date: str = None):
         )
         return
 
-    import re
     if not re.match(r'^\d{2}/\d{2}$', date.strip()):
         await interaction.response.send_message(
             embed=make_embed("▲ INVALID FORMAT", "Use `MM/DD` format — e.g. `04/15`.", color=0xE63946)
@@ -1489,10 +1477,19 @@ async def todo_done(interaction: discord.Interaction, numbers: str):
         )
     )
 
+# ── FIX: /todo list — was missing the shadow_id check causing silent failures ──
 @todo_group.command(name="list", description="View your operative dossier")
 async def todo_list(interaction: discord.Interaction):
     data   = await load_data()
     uid    = str(interaction.user.id)
+
+    # FIX: Added missing shadow_id check
+    if not get_shadow_id(uid, data):
+        await interaction.response.send_message(
+            embed=make_embed("▲ NOT LINKED", "Link your Shadow ID first — use `/link <shadow_id> <n>`.", color=0xE63946)
+        )
+        return
+
     active = get_active_date(uid, data)
     todos  = get_todos_for_date(uid, active, data)
 
@@ -1910,6 +1907,306 @@ async def op_move(interaction: discord.Interaction, sources: str, target: int):
 
 tree.add_command(op_group)
 
+# ══════════════════════════════════════════════════════════════════
+#  /exam — EXAM COUNTDOWN SYSTEM (NEW)
+# ══════════════════════════════════════════════════════════════════
+
+GROQ_API_KEY_MAIN = os.getenv("GROQ_API_KEY")
+GROQ_API_URL_MAIN = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL_MAIN   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+async def _fetch_exam_date_via_groq(exam_name: str) -> str | None:
+    """
+    Use Groq to try to find the exam date from internet knowledge.
+    Returns a date string like 'MM/DD/YYYY' or None if not found.
+    """
+    if not GROQ_API_KEY_MAIN:
+        return None
+
+    tz   = pytz.timezone(TIMEZONE)
+    year = datetime.now(tz).year
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY_MAIN}",
+        "Content-Type": "application/json",
+    }
+    prompt = (
+        f"What is the exam date for '{exam_name}' in {year}? "
+        f"If you know the date, respond ONLY with the date in MM/DD/YYYY format and nothing else. "
+        f"If you don't know or it's not a real exam, respond with exactly: UNKNOWN"
+    )
+    payload = {
+        "model": GROQ_MODEL_MAIN,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a precise assistant that only returns dates in MM/DD/YYYY format. "
+                    "If you know the exam date, return only that. Otherwise return UNKNOWN. No explanations."
+                )
+            },
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 20,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                GROQ_API_URL_MAIN, headers=headers, json=payload,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    data_r  = await resp.json()
+                    result  = data_r["choices"][0]["message"]["content"].strip()
+                    if result == "UNKNOWN":
+                        return None
+                    # Validate format MM/DD/YYYY
+                    if re.match(r'^\d{2}/\d{2}/\d{4}$', result):
+                        datetime.strptime(result, "%m/%d/%Y")  # validate it's real
+                        return result
+    except Exception as e:
+        print(f"[EXAM DATE FETCH] Groq error: {e}")
+
+    return None
+
+def _days_until(date_str: str) -> int:
+    """Returns days until the given MM/DD/YYYY date. Negative = past."""
+    tz       = pytz.timezone(TIMEZONE)
+    now_date = datetime.now(tz).date()
+    exam_dt  = datetime.strptime(date_str, "%m/%d/%Y").date()
+    return (exam_dt - now_date).days
+
+def _format_exam_countdown(days: int) -> str:
+    if days < 0:
+        return f"**{abs(days)} days ago** *(past)*"
+    elif days == 0:
+        return "**TODAY** 🚨"
+    elif days == 1:
+        return "**TOMORROW** ⚠️"
+    elif days <= 7:
+        return f"**{days} days** 🔥"
+    elif days <= 30:
+        return f"**{days} days** ⏳"
+    else:
+        return f"**{days} days**"
+
+exam_group = app_commands.Group(name="exam", description="Track your upcoming exams with countdowns")
+
+@exam_group.command(name="add", description="Add an exam to your profile — auto-fetches date if possible")
+@app_commands.describe(
+    name="Exam name e.g. 'JEE Advanced 2025', 'Physics Mid-Term', 'UPSC Prelims'",
+    date="Date in MM/DD/YYYY format e.g. 05/25/2025 (leave blank to auto-fetch)"
+)
+async def exam_add(interaction: discord.Interaction, name: str, date: str = None):
+    await interaction.response.defer()
+
+    uid  = str(interaction.user.id)
+    data = await load_data()
+
+    # Validate manually provided date
+    if date:
+        date = date.strip()
+        if not re.match(r'^\d{2}/\d{2}/\d{4}$', date):
+            await interaction.followup.send(
+                embed=make_embed("▲ INVALID DATE FORMAT", "Use `MM/DD/YYYY` — e.g. `05/25/2025`.", color=0xE63946)
+            )
+            return
+        try:
+            datetime.strptime(date, "%m/%d/%Y")
+        except ValueError:
+            await interaction.followup.send(
+                embed=make_embed("▲ INVALID DATE", f"`{date}` is not a real date.", color=0xE63946)
+            )
+            return
+        exam_date  = date
+        date_source = "manual"
+    else:
+        # Try to auto-fetch via Groq
+        exam_date   = await _fetch_exam_date_via_groq(name)
+        date_source = "auto-fetched" if exam_date else None
+
+    if "exams" not in data:
+        data["exams"] = {}
+    if uid not in data["exams"]:
+        data["exams"][uid] = []
+
+    if exam_date:
+        days = _days_until(exam_date)
+        exam_entry = {
+            "name":   name,
+            "date":   exam_date,
+            "source": date_source,
+        }
+        data["exams"][uid].append(exam_entry)
+        await save_data(data)
+
+        countdown = _format_exam_countdown(days)
+        source_note = " *(date auto-fetched)*" if date_source == "auto-fetched" else ""
+
+        embed = make_embed(
+            "📅 EXAM ADDED",
+            f"**{name}**{source_note}\n\n"
+            f"📆 Date: **{exam_date}**\n"
+            f"⏳ Countdown: {countdown}\n\n"
+            f"Use `/exam list` to see all your exams.",
+            color=0xA855F7
+        )
+        await interaction.followup.send(embed=embed)
+
+    else:
+        # Couldn't auto-fetch — ask for manual date
+        embed = make_embed(
+            "📅 DATE NOT FOUND",
+            f"Couldn't find the date for **{name}** automatically.\n\n"
+            f"Please add it manually:\n"
+            f"`/exam add name:{name} date:MM/DD/YYYY`\n\n"
+            f"*(For common exams like JEE, NEET, UPSC, SAT, GRE — use the official name)*",
+            color=0xF0A500
+        )
+        await interaction.followup.send(embed=embed)
+
+@exam_group.command(name="list", description="View all your upcoming exams with countdowns")
+async def exam_list(interaction: discord.Interaction):
+    data = await load_data()
+    uid  = str(interaction.user.id)
+
+    exams = data.get("exams", {}).get(uid, [])
+
+    if not exams:
+        await interaction.response.send_message(
+            embed=make_embed(
+                "📅 NO EXAMS",
+                "You haven't added any exams yet.\nUse `/exam add <name>` to track an exam.",
+                color=0x7B2FBE
+            )
+        )
+        return
+
+    # Sort by date, soonest first
+    def sort_key(e):
+        try:
+            return datetime.strptime(e["date"], "%m/%d/%Y")
+        except:
+            return datetime.max
+
+    sorted_exams = sorted(exams, key=sort_key)
+
+    lines = []
+    for i, exam in enumerate(sorted_exams, 1):
+        days      = _days_until(exam["date"])
+        countdown = _format_exam_countdown(days)
+        source    = " *(auto)*" if exam.get("source") == "auto-fetched" else ""
+        lines.append(
+            f"**{i}.** {exam['name']}{source}\n"
+            f"    📆 {exam['date']} · {countdown}"
+        )
+
+    embed = make_embed(
+        f"📅 {interaction.user.display_name}'s EXAM COUNTDOWN",
+        "\n\n".join(lines),
+        color=0xA855F7
+    )
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · Grind before the deadline")
+    await interaction.response.send_message(embed=embed)
+
+@exam_group.command(name="remove", description="Remove an exam from your list")
+@app_commands.describe(number="Exam number from /exam list")
+async def exam_remove(interaction: discord.Interaction, number: int):
+    data  = await load_data()
+    uid   = str(interaction.user.id)
+    exams = data.get("exams", {}).get(uid, [])
+
+    if not exams or number < 1 or number > len(exams):
+        await interaction.response.send_message(
+            embed=make_embed("▲ EXAM NOT FOUND", f"Exam #{number} doesn't exist. Check `/exam list`.", color=0xE63946)
+        )
+        return
+
+    # Sort same way as list so numbers match
+    def sort_key(e):
+        try:
+            return datetime.strptime(e["date"], "%m/%d/%Y")
+        except:
+            return datetime.max
+
+    sorted_exams = sorted(exams, key=sort_key)
+    removed      = sorted_exams.pop(number - 1)
+
+    # Rebuild in original insert order, minus the removed one
+    new_exams = [e for e in exams if not (e["name"] == removed["name"] and e["date"] == removed["date"])]
+    # Handle edge case of duplicate name+date by removing only first match
+    if len(new_exams) == len(exams):
+        exams.remove(removed)
+        new_exams = exams
+
+    data["exams"][uid] = new_exams
+    await save_data(data)
+
+    await interaction.response.send_message(
+        embed=make_embed(
+            "◈ EXAM REMOVED",
+            f"~~{removed['name']}~~ removed from your countdown list.\n"
+            f"`{len(new_exams)}` exam(s) remaining.",
+            color=0x6B6B9A
+        )
+    )
+
+tree.add_command(exam_group)
+
+# ── /exams — server-wide exam countdown ──────────────────────────
+@tree.command(name="exams", description="View all upcoming exams across the server")
+async def exams_server(interaction: discord.Interaction):
+    data = await load_data()
+
+    all_exams = []  # (exam_dict, discord_member)
+    for uid, user_exams in data.get("exams", {}).items():
+        member_obj = interaction.guild.get_member(int(uid)) if interaction.guild else None
+        name       = member_obj.display_name if member_obj else f"Operative {uid[:4]}"
+        for exam in user_exams:
+            all_exams.append((exam, name))
+
+    if not all_exams:
+        await interaction.response.send_message(
+            embed=make_embed(
+                "📅 NO EXAMS",
+                "No exams added yet. Members can add their exams with `/exam add`.",
+                color=0x7B2FBE
+            )
+        )
+        return
+
+    def sort_key(pair):
+        try:
+            return datetime.strptime(pair[0]["date"], "%m/%d/%Y")
+        except:
+            return datetime.max
+
+    sorted_all = sorted(all_exams, key=sort_key)
+
+    lines = []
+    for exam, member_name in sorted_all:
+        days      = _days_until(exam["date"])
+        countdown = _format_exam_countdown(days)
+        lines.append(
+            f"**{exam['name']}** · *{member_name}*\n"
+            f"    📆 {exam['date']} · {countdown}"
+        )
+
+    # Chunk if too long
+    desc = "\n\n".join(lines)
+    if len(desc) > 3900:
+        desc = "\n\n".join(lines[:15]) + f"\n\n*...and {len(lines) - 15} more*"
+
+    embed = make_embed(
+        "📅 SERVER EXAM COUNTDOWN",
+        desc,
+        color=0xF0A500
+    )
+    embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · {len(sorted_all)} total exams tracked")
+    await interaction.response.send_message(embed=embed)
+
 # ── /echoes ───────────────────────────────────────────────────────
 @tree.command(name="echoes", description="Reveal your echo resonance and operative rank")
 async def echoes(interaction: discord.Interaction):
@@ -1947,7 +2244,6 @@ async def echoes(interaction: discord.Interaction):
     is_today      = active == today_str()
     session_label = "Today's Objectives" if is_today else f"Objectives ({active})"
 
-    # Session stats
     today      = today_str()
     daily_key  = f"{uid}_{today}"
     daily_sess = data.get("daily_session_echoes", {}).get(daily_key, 0)
@@ -1956,6 +2252,13 @@ async def echoes(interaction: discord.Interaction):
         try: sg_count = json.loads(sg_count)
         except: sg_count = {}
     sg_count = sg_count.get("shadow_grind", 0) if isinstance(sg_count, dict) else 0
+
+    # Upcoming exams
+    user_exams = data.get("exams", {}).get(uid, [])
+    upcoming   = sorted(
+        [e for e in user_exams if _days_until(e["date"]) >= 0],
+        key=lambda e: _days_until(e["date"])
+    )[:2]
 
     tier  = get_tier(count)
     embed = discord.Embed(title=f"☭ {member['codename']}", color=tier["color"])
@@ -1966,6 +2269,12 @@ async def echoes(interaction: discord.Interaction):
     embed.add_field(name="Study Echoes Today", value=f"{daily_sess}/{DAILY_SESSION_CAP}", inline=True)
     if sg_count:
         embed.add_field(name="Shadow Grind", value=f"🏅 × {sg_count}", inline=True)
+    if upcoming:
+        exam_lines = "\n".join(
+            f"📅 **{e['name']}** — {_format_exam_countdown(_days_until(e['date']))}"
+            for e in upcoming
+        )
+        embed.add_field(name="Upcoming Exams", value=exam_lines, inline=False)
     embed.set_footer(text="☭ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
     await interaction.followup.send(embed=embed)
 
@@ -2023,7 +2332,6 @@ async def link(interaction: discord.Interaction, shadow_id: str, name: str):
         )
         return
 
-    import re
     if not re.match(r'^SS\d{4}$', sid):
         await interaction.response.send_message(
             embed=make_embed("▲ INVALID SHADOW ID", "The format must be `SS####` — e.g. `SS0069`. Check your credentials.", color=0xE63946),
@@ -2312,12 +2620,7 @@ async def syncids(interaction: discord.Interaction):
     )
 
 # ── /welcome ──────────────────────────────────────────────────────
-GROQ_API_KEY_MAIN = os.getenv("GROQ_API_KEY")
-GROQ_API_URL_MAIN = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL_MAIN   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
 async def _generate_welcome_text(welcomer_name: str, new_member_name: str) -> str:
-    """Call Groq to generate a shadow-themed welcome message."""
     if not GROQ_API_KEY_MAIN:
         return (
             f"*The void stirs. A new shadow joins the Order.*\n\n"
@@ -2370,7 +2673,6 @@ async def _generate_welcome_text(welcomer_name: str, new_member_name: str) -> st
     except Exception as e:
         print(f"[WELCOME AI] Error: {e}")
 
-    # Fallback if API fails
     return (
         f"*The void stirs. A new shadow joins the Order.*\n\n"
         f"**{new_member_name}**, you were brought here by **{welcomer_name}** — and the Order does not forget a debt.\n\n"
@@ -2407,7 +2709,7 @@ async def welcome(interaction: discord.Interaction, member: discord.Member):
         color=0x7B2FBE
     )
     embed.set_author(
-        name=f"☽ THE ORDER WELCOMES A NEW SHADOW",
+        name="☽ THE ORDER WELCOMES A NEW SHADOW",
         icon_url=member.display_avatar.url if member.display_avatar else None
     )
     embed.add_field(
@@ -2449,15 +2751,6 @@ async def on_ready():
     await pull_from_gas(data)
     loaded = await load_data()
     print(f"[SHADOW BOT] Loaded {len(loaded['members'])} members from GAS")
-
-    # Seed VC join times for anyone already in voice on startup
-    for guild in bot.guilds:
-        for vc in guild.voice_channels:
-            for member in vc.members:
-                if not member.bot:
-                    uid = str(member.id)
-                    if uid not in loaded["active_sessions"]:
-                        pass  # They're in VC but no session — will be prompted on next join
 
     daily_echo_task.start()
     session_ticker.start()
