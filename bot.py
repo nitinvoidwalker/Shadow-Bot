@@ -1271,30 +1271,15 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 await sess_ch.send(content=member.mention, embed=dm_embed)
             return
 
-        # ── FIX: VC join ping goes to the text channel in the same category as the VC ──
-        ping_ch = None
-        vc_category = after.channel.category if after.channel else None
-        if vc_category:
-            # Look for a text channel in the same category as the VC
-            ping_ch = next(
-                (ch for ch in vc_category.text_channels),
-                None
-            )
-        if not ping_ch:
-            ping_ch = discord.utils.get(member.guild.text_channels, name=FOCUS_LOG_CHANNEL)
-        if not ping_ch:
-            ping_ch = discord.utils.get(member.guild.text_channels, name=GENERAL_CHANNEL)
+        # ── Send ping directly into the VC channel itself ──
+        vc_chan = after.channel
+        print(f"[VC JOIN] uid={uid} codename={codename} linked={shadow_id is not None} vc={vc_chan}")
 
-        print(f"[VC JOIN] uid={uid} codename={codename} linked={shadow_id is not None} ping_ch={ping_ch}")
-
-        if ping_ch:
+        try:
             if shadow_id:
-                # Linked operative — show full prompt with session start CTA
                 prompt_embed = make_embed(
                     "☽ OPERATIVE ENTERED THE VOID",
-                    f"**{codename}** joined **{after.channel.name}**\n\n"
-                    f"Start a session to earn echoes while you're here.\n"
-                    f"Use `/study <task>` or `/pomodoro <task>` to lock in.",
+                    f"**{codename}** locked in.\n\nStart a session to earn echoes while you're here.\nUse `/study <task>` or `/pomodoro <task>` to lock in.",
                     color=0x6B6B9A
                 )
                 prompt_embed.set_author(
@@ -1302,13 +1287,11 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     icon_url=member.display_avatar.url if member.display_avatar else None
                 )
                 prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
-                await ping_ch.send(content=member.mention, embed=prompt_embed)
+                await vc_chan.send(content=member.mention, embed=prompt_embed)
             else:
-                # Unlinked member — simple join ping
                 prompt_embed = make_embed(
                     "🎙️ MEMBER JOINED VC",
-                    f"**{codename}** joined **{after.channel.name}**\n\n"
-                    f"Link your Shadow ID with `/link <shadow_id> <name>` to earn echoes.",
+                    f"**{codename}** joined.\n\nLink your Shadow ID with `/link <shadow_id> <n>` to earn echoes.",
                     color=0x4B4B6B
                 )
                 prompt_embed.set_author(
@@ -1316,7 +1299,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     icon_url=member.display_avatar.url if member.display_avatar else None
                 )
                 prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
-                await ping_ch.send(embed=prompt_embed)
+                await vc_chan.send(embed=prompt_embed)
+        except Exception as e:
+            print(f"[VC JOIN] Could not send to VC channel: {e}")
+
 
     elif left:
         join_time = _vc_join_times.pop(uid, None)
@@ -1932,7 +1918,7 @@ GROQ_MODEL_MAIN   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 async def _fetch_exam_date_via_groq(exam_name: str) -> str | None:
     """
-    Use Groq to try to find the exam date from internet knowledge.
+    Use Groq with web_search tool to find the real exam date.
     Returns a date string like 'MM/DD/YYYY' or None if not found.
     """
     if not GROQ_API_KEY_MAIN:
@@ -1945,42 +1931,57 @@ async def _fetch_exam_date_via_groq(exam_name: str) -> str | None:
         "Authorization": f"Bearer {GROQ_API_KEY_MAIN}",
         "Content-Type": "application/json",
     }
-    prompt = (
-        f"What is the exam date for '{exam_name}' in {year}? "
-        f"If you know the date, respond ONLY with the date in MM/DD/YYYY format and nothing else. "
-        f"If you don't know or it's not a real exam, respond with exactly: UNKNOWN"
-    )
+
+    # Step 1: Ask Groq to search for the exam date
     payload = {
-        "model": GROQ_MODEL_MAIN,
+        "model": "llama-3.3-70b-versatile",
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "You are a precise assistant that only returns dates in MM/DD/YYYY format. "
-                    "If you know the exam date, return only that. Otherwise return UNKNOWN. No explanations."
+                    "You are a precise assistant. The user will give you an exam name. "
+                    "Search the web and return ONLY the exam date in MM/DD/YYYY format. "
+                    "If you cannot find the exact date, respond with exactly: UNKNOWN. "
+                    "No explanations, no extra text — just the date or UNKNOWN."
                 )
             },
-            {"role": "user", "content": prompt}
+            {
+                "role": "user",
+                "content": f"What is the official exam date for '{exam_name}' in {year}? Search and return only MM/DD/YYYY or UNKNOWN."
+            }
         ],
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "auto",
         "temperature": 0.1,
-        "max_tokens": 20,
+        "max_tokens": 100,
     }
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 GROQ_API_URL_MAIN, headers=headers, json=payload,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=20)
             ) as resp:
                 if resp.status == 200:
-                    data_r  = await resp.json()
-                    result  = data_r["choices"][0]["message"]["content"].strip()
-                    if result == "UNKNOWN":
-                        return None
-                    # Validate format MM/DD/YYYY
-                    if re.match(r'^\d{2}/\d{2}/\d{4}$', result):
-                        datetime.strptime(result, "%m/%d/%Y")  # validate it's real
-                        return result
+                    data_r = await resp.json()
+                    # Handle tool-use response — extract text content
+                    for choice in data_r.get("choices", []):
+                        msg = choice.get("message", {})
+                        result = (msg.get("content") or "").strip()
+                        if result and result != "UNKNOWN":
+                            # Try to extract MM/DD/YYYY from the result
+                            match = re.search(r"\d{2}/\d{2}/\d{4}", result)
+                            if match:
+                                candidate = match.group(0)
+                                try:
+                                    datetime.strptime(candidate, "%m/%d/%Y")
+                                    return candidate
+                                except ValueError:
+                                    pass
+                        elif result == "UNKNOWN":
+                            return None
+                else:
+                    print(f"[EXAM DATE FETCH] Groq HTTP {resp.status}")
     except Exception as e:
         print(f"[EXAM DATE FETCH] Groq error: {e}")
 
@@ -2744,6 +2745,144 @@ async def welcome(interaction: discord.Interaction, member: discord.Member):
         content=f"{interaction.user.mention} welcomes {member.mention} into the void 🦇",
         embed=embed
     )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /ask — AI OPERATIVE ADVISOR (context-aware)
+# ══════════════════════════════════════════════════════════════════
+
+async def _build_user_context(uid: str, data: dict) -> str:
+    """Build a rich context string about the operative for the AI."""
+    today  = today_str()
+    lines  = []
+
+    # Identity
+    shadow_id = get_shadow_id(uid, data)
+    if shadow_id:
+        member = get_member(shadow_id, data)
+        codename   = member.get("codename", shadow_id) if member else shadow_id
+        echo_count = int(member.get("echoCount", 0)) if member else 0
+        tier = get_tier(echo_count)
+        lines.append(f"OPERATIVE: {codename} (Shadow ID: {shadow_id})")
+        lines.append(f"RANK: {tier['name']} · {echo_count} echoes")
+    else:
+        lines.append("OPERATIVE: Unlinked (no Shadow ID)")
+
+    # Today's todos
+    active_date = get_active_date(uid, data)
+    todos = get_todos_for_date(uid, active_date, data)
+    if todos:
+        done   = [t for t in todos if isinstance(t, dict) and t.get("done")]
+        undone = [t for t in todos if isinstance(t, dict) and not t.get("done") and "task" in t]
+        lines.append(f"\nTODAY'S OBJECTIVES ({active_date}):")
+        for t in undone:
+            ops = t.get("ops", [])
+            ops_str = f" [{sum(1 for op in ops if op.get('done'))}/{len(ops)} ops done]" if ops else ""
+            lines.append(f"  PENDING: {t['task']}{ops_str}")
+        for t in done:
+            lines.append(f"  DONE: {t['task']}")
+    else:
+        lines.append("\nTODAY'S OBJECTIVES: None added yet.")
+
+    # Active session
+    sess = data.get("active_sessions", {}).get(uid)
+    if sess and isinstance(sess, dict):
+        elapsed = int(time_module.time() - sess.get("start_time", 0))
+        lines.append(f"\nACTIVE SESSION: '{sess.get('task','?')}' · {format_duration(elapsed)} elapsed · type={sess.get('session_type','study')}")
+    else:
+        lines.append("\nACTIVE SESSION: None")
+
+    # Session history (last 7)
+    history = data.get("session_history", {}).get(uid, [])
+    if history:
+        recent = sorted(history, key=lambda x: x.get("date", ""), reverse=True)[:7]
+        lines.append("\nRECENT SESSION HISTORY (last 7):")
+        for h in recent:
+            lines.append(f"  {h.get('date','?')} · {h.get('session_type','study')} · {format_duration(h.get('duration_seconds',0))} · '{h.get('task','?')}'")
+    else:
+        lines.append("\nRECENT SESSION HISTORY: None.")
+
+    # Exams
+    exams = data.get("exams", {}).get(uid, [])
+    if exams:
+        lines.append("\nUPCOMING EXAMS:")
+        for e in sorted(exams, key=lambda x: x.get("date", "")):
+            days = _days_until(e["date"])
+            lines.append(f"  {e['name']} · {e['date']} · {_format_exam_countdown(days)}")
+    else:
+        lines.append("\nUPCOMING EXAMS: None.")
+
+    return "\n".join(lines)
+
+
+@tree.command(name="ask", description="Ask the Shadow AI anything — it knows your todos, sessions, echoes, and exams")
+@app_commands.describe(question="e.g. 'How am I doing today?', 'What should I focus on?', 'Am I on track?'")
+async def ask_ai(interaction: discord.Interaction, question: str):
+    await interaction.response.defer()
+
+    data = await load_data()
+    uid  = str(interaction.user.id)
+    context = await _build_user_context(uid, data)
+
+    if not GROQ_API_KEY_MAIN:
+        await interaction.followup.send(
+            embed=make_embed("▲ AI OFFLINE", "No GROQ_API_KEY configured.", color=0xE63946)
+        )
+        return
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY_MAIN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL_MAIN,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are the Shadow AI — an elite performance advisor inside the ShadowSeekers Order, "
+                    "a secret society of high-performance individuals who grind in silence and build in the dark. "
+                    "Your tone is sharp, direct, and tactical — like a seasoned commander briefing an operative. "
+                    "You have full access to the operative's real-time data below. "
+                    "Always reference their actual tasks, numbers, and streaks — never be generic. "
+                    "Give specific, actionable advice. Keep responses under 220 words. "
+                    "Use ☽ and ◈ for structure. No markdown headers.\n\n"
+                    f"=== OPERATIVE DATA ===\n{context}\n=== END DATA ==="
+                )
+            },
+            {"role": "user", "content": question}
+        ],
+        "temperature": 0.75,
+        "max_tokens": 400,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            async with http_session.post(
+                GROQ_API_URL_MAIN, headers=headers, json=payload,
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                if resp.status == 200:
+                    data_r = await resp.json()
+                    answer = data_r["choices"][0]["message"]["content"].strip()
+                    embed  = make_embed("◈ SHADOW AI", answer, color=0x7B2FBE)
+                    embed.set_author(
+                        name=f"Query: {question[:60]}{'...' if len(question) > 60 else ''}",
+                        icon_url=interaction.user.display_avatar.url if interaction.user.display_avatar else None
+                    )
+                    await interaction.followup.send(embed=embed)
+                else:
+                    err = await resp.text()
+                    print(f"[ASK AI] Groq {resp.status}: {err[:200]}")
+                    await interaction.followup.send(
+                        embed=make_embed("▲ AI ERROR", f"Shadow AI failed (HTTP {resp.status}).", color=0xE63946)
+                    )
+    except Exception as e:
+        print(f"[ASK AI] Exception: {e}")
+        await interaction.followup.send(
+            embed=make_embed("▲ AI ERROR", "Shadow AI is unreachable right now.", color=0xE63946)
+        )
+
 
 # ── BOT EVENTS ────────────────────────────────────────────────────
 @bot.event
