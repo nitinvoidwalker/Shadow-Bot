@@ -1181,59 +1181,74 @@ async def phantom_alert_task():
 
 
 # ── TTS: speak a greeting when someone joins VC ────────────────────────────
+# Global lock so only one TTS plays at a time per guild
+_tts_locks: dict = {}
+
 async def speak_in_vc(channel: discord.VoiceChannel, text: str) -> None:
     """Join `channel`, speak `text` via TTS, then disconnect."""
-    voice_client = channel.guild.voice_client  # already connected to this guild?
+    guild_id = channel.guild.id
 
-    try:
-        # Generate TTS audio to a temp file
-        loop = asyncio.get_event_loop()
-        tts = await loop.run_in_executor(None, lambda: gTTS(text=text, lang="en", slow=False))
+    # One TTS at a time per guild — skip if already speaking
+    if guild_id not in _tts_locks:
+        _tts_locks[guild_id] = asyncio.Lock()
+    if _tts_locks[guild_id].locked():
+        print(f"[TTS] Skipping — already speaking in guild {guild_id}")
+        return
 
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp_path = tmp.name
-        await loop.run_in_executor(None, tts.save, tmp_path)
+    tmp_path = None
+    voice_client = None
 
-        # Connect or move to the right channel
-        if voice_client and voice_client.is_connected():
-            if voice_client.channel != channel:
-                await voice_client.move_to(channel)
-        else:
-            voice_client = await channel.connect()
-
-        # Wait if already playing (e.g. two people joined simultaneously)
-        waited = 0
-        while voice_client.is_playing() and waited < 10:
-            await asyncio.sleep(0.5)
-            waited += 0.5
-
-        # Play and wait for finish
-        done_event = asyncio.Event()
-        def after_play(err):
-            if err:
-                print(f"[TTS] Playback error: {err}")
-            done_event.set()
-
-        voice_client.play(
-            discord.FFmpegPCMAudio(tmp_path, executable="ffmpeg"),
-            after=after_play,
-        )
-        await asyncio.wait_for(done_event.wait(), timeout=30)
-
-    except Exception as e:
-        print(f"[TTS] speak_in_vc error: {e}")
-    finally:
-        # Clean up temp file
+    async with _tts_locks[guild_id]:
         try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-        # Disconnect after speaking
-        try:
-            if voice_client and voice_client.is_connected():
-                await voice_client.disconnect()
-        except Exception:
-            pass
+            # Generate TTS audio to a temp file BEFORE connecting to voice
+            loop = asyncio.get_event_loop()
+            tts = await loop.run_in_executor(None, lambda: gTTS(text=text, lang="en", slow=False))
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp_path = tmp.name
+            await loop.run_in_executor(None, tts.save, tmp_path)
+
+            # Force-disconnect any stale voice client first
+            existing = channel.guild.voice_client
+            if existing:
+                try:
+                    await existing.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)  # let Discord settle
+
+            # Fresh connect with timeout
+            voice_client = await asyncio.wait_for(channel.connect(), timeout=15)
+
+            # Play and wait for finish
+            done_event = asyncio.Event()
+            def after_play(err):
+                if err:
+                    print(f"[TTS] Playback error: {err}")
+                done_event.set()
+
+            voice_client.play(
+                discord.FFmpegPCMAudio(tmp_path, executable="ffmpeg"),
+                after=after_play,
+            )
+            await asyncio.wait_for(done_event.wait(), timeout=30)
+
+        except asyncio.TimeoutError:
+            print(f"[TTS] Timed out connecting to voice in {channel.name}")
+        except Exception as e:
+            print(f"[TTS] speak_in_vc error: {e}")
+        finally:
+            # Clean up temp file
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            # Disconnect after speaking
+            try:
+                if voice_client and voice_client.is_connected():
+                    await voice_client.disconnect()
+            except Exception:
+                pass
 
 
 _vc_join_times: dict = {}
