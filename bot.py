@@ -51,8 +51,6 @@ import pytz
 import motor.motor_asyncio
 import time as time_module
 import re
-import tempfile
-from gtts import gTTS
 from ai_missions import setup_ai_missions, ai_mission_task
 
 # ── CONFIG ────────────────────────────────────────────────────────
@@ -1181,76 +1179,6 @@ async def phantom_alert_task():
 
 
 # ── TTS: speak a greeting when someone joins VC ────────────────────────────
-# Global lock so only one TTS plays at a time per guild
-_tts_locks: dict = {}
-
-async def speak_in_vc(channel: discord.VoiceChannel, text: str) -> None:
-    """Join `channel`, speak `text` via TTS, then disconnect."""
-    guild_id = channel.guild.id
-
-    # One TTS at a time per guild — skip if already speaking
-    if guild_id not in _tts_locks:
-        _tts_locks[guild_id] = asyncio.Lock()
-    if _tts_locks[guild_id].locked():
-        print(f"[TTS] Skipping — already speaking in guild {guild_id}")
-        return
-
-    tmp_path = None
-    voice_client = None
-
-    async with _tts_locks[guild_id]:
-        try:
-            # Generate TTS audio to a temp file BEFORE connecting to voice
-            loop = asyncio.get_event_loop()
-            tts = await loop.run_in_executor(None, lambda: gTTS(text=text, lang="en", slow=False))
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                tmp_path = tmp.name
-            await loop.run_in_executor(None, tts.save, tmp_path)
-
-            # Force-disconnect any stale voice client first
-            existing = channel.guild.voice_client
-            if existing:
-                try:
-                    await existing.disconnect(force=True)
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)  # let Discord settle
-
-            # Fresh connect with timeout
-            voice_client = await asyncio.wait_for(channel.connect(), timeout=15)
-
-            # Play and wait for finish
-            done_event = asyncio.Event()
-            def after_play(err):
-                if err:
-                    print(f"[TTS] Playback error: {err}")
-                done_event.set()
-
-            voice_client.play(
-                discord.FFmpegPCMAudio(tmp_path, executable="ffmpeg"),
-                after=after_play,
-            )
-            await asyncio.wait_for(done_event.wait(), timeout=30)
-
-        except asyncio.TimeoutError:
-            print(f"[TTS] Timed out connecting to voice in {channel.name}")
-        except Exception as e:
-            print(f"[TTS] speak_in_vc error: {e}")
-        finally:
-            # Clean up temp file
-            if tmp_path:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-            # Disconnect after speaking
-            try:
-                if voice_client and voice_client.is_connected():
-                    await voice_client.disconnect()
-            except Exception:
-                pass
-
-
 _vc_join_times: dict = {}
 
 @bot.event
@@ -1362,9 +1290,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 )
                 prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
                 await vc_chan.send(content=member.mention, embed=prompt_embed)
-                # ── TTS greeting (linked operative) ──
-                tts_text = f"Welcome, {codename}. Lock in and start your session."
-                asyncio.create_task(speak_in_vc(vc_chan, tts_text))
             else:
                 prompt_embed = make_embed(
                     "🎙️ MEMBER JOINED VC",
@@ -1377,9 +1302,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 )
                 prompt_embed.set_footer(text="SHADOWSEEKERS ORDER · VC detected")
                 await vc_chan.send(embed=prompt_embed)
-                # ── TTS greeting (unlinked member) ──
-                tts_text = f"{codename} has joined the voice channel. Link your Shadow ID to earn echoes."
-                asyncio.create_task(speak_in_vc(vc_chan, tts_text))
         except Exception as e:
             print(f"[VC JOIN] Could not send to VC channel: {e}")
 
