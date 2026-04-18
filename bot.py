@@ -52,6 +52,7 @@ import motor.motor_asyncio
 import time as time_module
 import re
 from ai_missions import setup_ai_missions, ai_mission_task
+from shadow_ai import handle_mention, setup_shadow_ai
 
 # ── CONFIG ────────────────────────────────────────────────────────
 TOKEN        = os.getenv("DISCORD_TOKEN")
@@ -2973,6 +2974,16 @@ async def ask_ai(interaction: discord.Interaction, question: str):
 
 # ── BOT EVENTS ────────────────────────────────────────────────────
 @bot.event
+async def on_message(message: discord.Message):
+    """Handle @Shadowbot mentions — route to Shadow AI chat engine."""
+    if message.author.bot:
+        return
+    if bot.user in message.mentions:
+        await handle_mention(message, bot, load_data, save_data)
+    await bot.process_commands(message)
+
+
+@bot.event
 async def on_ready():
     print(f"[SHADOW BOT] Logged in as {bot.user} ({bot.user.id})")
     if MONGO_URI:
@@ -2981,6 +2992,7 @@ async def on_ready():
         print("[SHADOW BOT] WARNING: MONGO_URI not set — using local file")
 
     setup_ai_missions(bot, tree)
+    setup_shadow_ai(bot)
 
     try:
         synced = await tree.sync()
