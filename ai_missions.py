@@ -129,7 +129,7 @@ def get_last_7_days_objectives(uid: str, data: dict) -> list[dict]:
     return result
 
 
-def build_mission_prompt(codename: str, tier_name: str, history: list[dict]) -> str:
+def build_mission_prompt(codename: str, tier_name: str, history: list[dict], plan_context: str = "") -> str:
     """
     Build the Groq prompt using the operative's history and tier.
     """
@@ -146,6 +146,7 @@ def build_mission_prompt(codename: str, tier_name: str, history: list[dict]) -> 
     prompt = f"""
 Operative Codename: {codename}
 Current Rank Tier: {tier_name}
+{plan_context}
 Objective History (last 7 days):
 {history_block}
 
@@ -242,7 +243,21 @@ async def generate_missions_for_user(uid: str, data: dict) -> list[str] | None:
             break
 
     history = get_last_7_days_objectives(uid, data)
-    prompt  = build_mission_prompt(codename, tier_name, history)
+
+    # Inject saved plan if exists
+    plan = data.get("plans", {}).get(uid)
+    plan_context = ""
+    if plan:
+        plan_context = f"""
+Operative's saved plan:
+- Goal: {plan.get('goal', '')}
+- Subjects: {', '.join(plan.get('subjects', []))}
+- Daily hours: {plan.get('hours_per_day', '?')}
+- Timeline: {plan.get('timeline', '?')}
+Use this plan as the primary source for mission topics.
+"""
+
+    prompt  = build_mission_prompt(codename, tier_name, history, plan_context)
     raw     = await call_groq(prompt)
 
     if not raw:
