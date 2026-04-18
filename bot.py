@@ -431,6 +431,27 @@ async def create_member_on_gas(member: dict) -> bool:
 _session_messages = {}   # uid -> discord.Message
 _live_board_message = None  # the one live board message in general
 
+async def purge_orphaned_boards(general_ch: discord.TextChannel):
+    """Scan recent channel history and delete any stale grind board messages the bot owns."""
+    global _live_board_message
+    try:
+        async for msg in general_ch.history(limit=50):
+            if msg.author != general_ch.guild.me:
+                continue
+            # Identify grind board messages by their embed title
+            if msg.embeds and msg.embeds[0].title and "GRIND BOARD" in msg.embeds[0].title:
+                # Skip the one we already have a ref to — it'll be deleted normally
+                if _live_board_message and msg.id == _live_board_message.id:
+                    continue
+                try:
+                    await msg.delete()
+                    print(f"[LIVE BOARD] Purged orphaned board message id={msg.id}")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[LIVE BOARD] Purge scan failed: {e}")
+
+
 async def update_live_board(guild: discord.Guild):
     """Delete and resend the live study board in general so it's always at the bottom."""
     global _live_board_message
@@ -451,6 +472,8 @@ async def update_live_board(guild: discord.Guild):
             except Exception:
                 pass
             _live_board_message = None
+        # Also purge any orphans left from a previous run
+        await purge_orphaned_boards(general_ch)
         return
 
     # Build embed
@@ -489,7 +512,10 @@ async def update_live_board(guild: discord.Guild):
     )
     embed.set_footer(text=f"Updates every 20s · Last updated {updated} IST")
 
-    # Delete old message, send new one at bottom
+    # Purge any orphaned boards from previous bot runs before sending
+    await purge_orphaned_boards(general_ch)
+
+    # Delete the tracked message, send fresh one at bottom
     if _live_board_message:
         try:
             await _live_board_message.delete()
@@ -3004,6 +3030,13 @@ async def on_ready():
     await pull_from_gas(data)
     loaded = await load_data()
     print(f"[SHADOW BOT] Loaded {len(loaded['members'])} members from GAS")
+
+    # Purge any leftover grind boards from before the restart
+    for guild in bot.guilds:
+        general_ch = discord.utils.get(guild.text_channels, name=GENERAL_CHANNEL)
+        if general_ch:
+            await purge_orphaned_boards(general_ch)
+            print("[LIVE BOARD] Startup purge complete")
 
     daily_echo_task.start()
     session_ticker.start()
