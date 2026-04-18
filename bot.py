@@ -428,6 +428,79 @@ async def create_member_on_gas(member: dict) -> bool:
 # FIX: Store message objects in memory; always edit in-place, never send new messages
 # from the ticker. The ticker only edits. If message is gone, clear the ref.
 _session_messages = {}   # uid -> discord.Message
+_live_board_message = None  # the one live board message in general
+
+async def update_live_board(guild: discord.Guild):
+    """Delete and resend the live study board in general so it's always at the bottom."""
+    global _live_board_message
+
+    data = await load_data()
+    now  = time_module.time()
+    sessions = data.get("active_sessions", {})
+
+    general_ch = discord.utils.get(guild.text_channels, name=GENERAL_CHANNEL)
+    if not general_ch:
+        return
+
+    if not sessions:
+        # No one studying — delete board if it exists
+        if _live_board_message:
+            try:
+                await _live_board_message.delete()
+            except Exception:
+                pass
+            _live_board_message = None
+        return
+
+    # Build embed
+    lines = []
+    for uid, sess in sorted(sessions.items(), key=lambda x: x[1].get("start_time", 0)):
+        elapsed   = int(now - sess.get("start_time", now))
+        codename  = sess.get("codename", "Unknown")
+        task      = sess.get("task", "Unknown task")
+        in_vc     = sess.get("in_vc", False)
+        sess_type = sess.get("session_type", "study")
+
+        if sess_type == "pomodoro":
+            type_icon = "🍅"
+        else:
+            type_icon = "📖"
+
+        vc_badge  = " · 🎙️ VC" if in_vc else ""
+        time_str  = format_duration(elapsed)
+        bar       = make_progress_bar(elapsed % 3600, 3600)
+
+        lines.append(
+            f"{type_icon} **{codename}**{vc_badge}\n"
+            f"┕ *{task}*\n"
+            f"┕ `[{bar}]` {time_str}"
+        )
+
+    count     = len(sessions)
+    ist       = pytz.timezone(TIMEZONE)
+    now_ist   = datetime.fromtimestamp(now, tz=ist)
+    updated   = now_ist.strftime("%I:%M %p")
+
+    embed = make_embed(
+        f"🟢 GRIND BOARD · {count} OPERATIVE{'S' if count != 1 else ''} LOCKED IN",
+        "\n\n".join(lines),
+        color=0x7B2FBE
+    )
+    embed.set_footer(text=f"Updates every 20s · Last updated {updated} IST")
+
+    # Delete old message, send new one at bottom
+    if _live_board_message:
+        try:
+            await _live_board_message.delete()
+        except Exception:
+            pass
+        _live_board_message = None
+
+    try:
+        _live_board_message = await general_ch.send(embed=embed)
+    except Exception as e:
+        print(f"[LIVE BOARD] Failed to send: {e}")
+
 
 @tasks.loop(seconds=20)
 async def session_ticker():
@@ -521,6 +594,13 @@ async def session_ticker():
 
         except Exception as e:
             print(f"[SESSION TICKER ERROR] uid={uid}: {e}")
+
+    # ── Update live group board in general ──
+    for guild in bot.guilds:
+        try:
+            await update_live_board(guild)
+        except Exception as e:
+            print(f"[LIVE BOARD] update error: {e}")
 
 # ── END OF DAY CALCULATION ────────────────────────────────────────
 async def run_end_of_day(guild: discord.Guild, announce=True):
