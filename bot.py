@@ -3433,14 +3433,9 @@ async def on_ready():
         )
     )
 
-    # Guild-specific sync (instant) + global sync (takes ~1hr but keeps commands available everywhere)
     try:
-        for guild in bot.guilds:
-            tree.copy_global_to(guild=guild)
-            await tree.sync(guild=guild)
-            print(f"[SHADOW BOT] Guild sync done: {guild.name}")
         synced = await tree.sync()
-        print(f"[SHADOW BOT] Global sync: {len(synced)} slash commands")
+        print(f"[SHADOW BOT] Synced {len(synced)} slash commands")
     except Exception as e:
         print(f"[SHADOW BOT] Sync error: {e}")
 
