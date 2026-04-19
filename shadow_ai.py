@@ -146,6 +146,39 @@ async def gas_delete_plan(uid: str):
         print(f"[SHADOW AI] GAS plan delete failed uid={uid}: {e}")
 
 
+async def gas_push_ghost_dm(uid: str, username: str, history: list[dict]):
+    """
+    Push Ghost onboarding DM conversation to GAS for performance tracking.
+    Fires after every exchange. GAS logs to a 'GhostDMs' sheet.
+    Payload: { action, uid, username, timestamp, messages: [{role, content}, ...] }
+    Only includes user + assistant turns (strips system prompt).
+    """
+    if not GAS_URL:
+        return
+    try:
+        clean = [
+            {"role": m["role"], "content": m["content"]}
+            for m in history
+            if m["role"] in ("user", "assistant")
+        ]
+        payload = {
+            "action":    "saveGhostDM",
+            "uid":       uid,
+            "username":  username,
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "messages":  clean,
+        }
+        async with aiohttp.ClientSession() as s:
+            await s.post(
+                GAS_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+        print(f"[GHOST DM] GAS push OK — uid={uid} ({len(clean)} turns)")
+    except Exception as e:
+        print(f"[GHOST DM] GAS push failed uid={uid}: {e}")
+
+
 # ── MONGO PLAN CACHE (TTL 15 min) ─────────────────────────────────
 # Bot passes in get_db so we don't import it directly
 
@@ -1442,7 +1475,7 @@ async def ghost_send_welcome(member: discord.Member, get_db_fn, bot_instance):
     # Run both concurrently
     await asyncio.gather(
         _ghost_general_welcome(member, guild, config, knowledge),
-        _ghost_send_dm_intro(member, knowledge),
+        _ghost_send_dm_intro(member, knowledge, config),
     )
 
 
@@ -1503,19 +1536,28 @@ async def _ghost_general_welcome(
         print(f"[GHOST] General welcome failed: {e}")
 
 
-async def _ghost_send_dm_intro(member: discord.Member, knowledge: str):
+async def _ghost_send_dm_intro(member: discord.Member, knowledge: str, config: dict):
     """AI-generated DM introducing Ghost and explaining the server."""
     uid    = str(member.id)
     system = _build_ghost_system_prompt(knowledge)
 
-    intro_prompt = (
-        f"New recruit '{member.display_name}' just joined. Send them a sharp intro DM as Ghost. "
-        "Tell them: (1) what the ShadowSeekers Order is in 1-2 sentences, "
-        "(2) that you're Ghost, their onboarding handler — not Shadow, "
-        "(3) their very first step is /link, "
-        "(4) invite them to reply here with any questions. "
-        "Under 100 words. No headers. Speak directly to them."
-    )
+    # Use admin-designed DM style if set, otherwise use default
+    custom_dm_instructions = config.get("dm_intro_instructions", "")
+    if custom_dm_instructions:
+        intro_prompt = (
+            f"New recruit '{member.display_name}' just joined. Send their welcome DM as Ghost.\n\n"
+            f"INSTRUCTIONS FROM ADMIN:\n{custom_dm_instructions}\n\n"
+            f"Under 120 words. No headers. Speak directly to them as Ghost."
+        )
+    else:
+        intro_prompt = (
+            f"New recruit '{member.display_name}' just joined. Send them a sharp intro DM as Ghost. "
+            "Tell them: (1) what the ShadowSeekers Order is in 1-2 sentences, "
+            "(2) that you're Ghost, their onboarding handler, "
+            "(3) their very first step is /link, "
+            "(4) invite them to reply here with any questions. "
+            "Under 100 words. No headers. Speak directly to them."
+        )
 
     messages = [
         {"role": "system", "content": system},
@@ -1532,8 +1574,9 @@ async def _ghost_send_dm_intro(member: discord.Member, knowledge: str):
         )
 
     _ghost_sessions[uid] = {
-        "active": True,
-        "history": [
+        "active":   True,
+        "username": member.display_name,
+        "history":  [
             {"role": "system",    "content": system},
             {"role": "assistant", "content": response},
         ],
@@ -1545,6 +1588,8 @@ async def _ghost_send_dm_intro(member: discord.Member, knowledge: str):
         embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
         await member.send(embed=embed)
         print(f"[GHOST] DM intro sent to {member} ({uid})")
+        # Push initial DM to GAS
+        asyncio.create_task(gas_push_ghost_dm(uid, member.display_name, _ghost_sessions[uid]["history"]))
     except discord.Forbidden:
         print(f"[GHOST] DMs closed for {member} ({uid}) — skipping DM intro")
         _ghost_sessions.pop(uid, None)
@@ -1589,6 +1634,11 @@ async def ghost_handle_dm(message: discord.Message, get_db_fn) -> bool:
     embed.set_author(name="☽ GHOST · ShadowSeekers Handler")
     embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
     await message.channel.send(embed=embed)
+
+    # Push updated DM history to GAS for performance tracking (fire-and-forget)
+    username = session.get("username") or message.author.display_name
+    asyncio.create_task(gas_push_ghost_dm(uid, username, session["history"]))
+
     return True
 
 
@@ -1942,4 +1992,126 @@ async def setwelcome_custom_handle_message(message: discord.Message, get_db_fn) 
 
 def welcome_custom_is_active(uid: str) -> bool:
     sess = _welcome_chat_sessions.get(uid)
+    return bool(sess and sess["active"])
+
+
+# ══════════════════════════════════════════════════════════════════
+# /SETWELCOME DM — AI-chat session to design the Ghost DM intro
+# ══════════════════════════════════════════════════════════════════
+
+_dm_design_sessions: dict[str, dict] = {}
+
+_DM_DESIGN_SYSTEM = """You are helping a Discord server admin design the Ghost onboarding DM intro message.
+
+Ghost is an AI bot that DMs every new member when they join the server.
+You need to understand what the admin wants Ghost to say in that first DM.
+
+YOUR JOB:
+- Chat with the admin to understand: the vibe/tone, what info to include, how to open, how to sign off.
+- Ask targeted questions: What's the energy? What must they mention? Any specific phrases or commands to highlight?
+- After 2–4 exchanges, output a JSON save block.
+
+WHEN READY, output EXACTLY this block:
+```json
+{"save_dm": true, "instructions": "Full detailed instructions for Ghost on how to write the DM intro. Be specific about tone, what to include, how to start, how to end, word limit."}
+```
+
+Rules:
+- Never output the JSON until you've had at least one exchange.
+- After the JSON, add: "✅ DM style saved. New members will get this intro from now on."
+- Instructions must be self-contained — Ghost reads them fresh for every new member.
+- Keep your own replies short and snappy."""
+
+
+async def setwelcome_dm_start(interaction: discord.Interaction, get_db_fn):
+    """Start AI chat to design the Ghost DM intro style."""
+    uid = str(interaction.user.id)
+
+    _dm_design_sessions[uid] = {
+        "active":    True,
+        "history":   [{"role": "system", "content": _DM_DESIGN_SYSTEM}],
+        "get_db_fn": get_db_fn,
+    }
+
+    opening = await call_shadow_ai([
+        {"role": "system", "content": _DM_DESIGN_SYSTEM},
+        {"role": "user",   "content": "Start the DM design session with a quick intro and first question."},
+    ])
+    if not opening:
+        opening = "Let's design Ghost's opening DM. What's the vibe you want — cold and sharp, warm and welcoming, hype, mysterious? And what's the #1 thing every new member must know from the first message?"
+
+    _dm_design_sessions[uid]["history"].append({"role": "assistant", "content": opening})
+
+    embed = discord.Embed(
+        title="◈ GHOST DM INTRO DESIGNER",
+        description=opening,
+        color=0x7B2FBE,
+    )
+    embed.set_footer(text="Chat here to design the DM · Type 'cancel' to abort")
+    await interaction.response.send_message(embed=embed)
+
+
+async def setwelcome_dm_handle_message(message: discord.Message, get_db_fn) -> bool:
+    """
+    Called from on_message during an active DM design session.
+    Returns True if handled.
+    """
+    uid     = str(message.author.id)
+    session = _dm_design_sessions.get(uid)
+    if not session or not session["active"]:
+        return False
+
+    content = message.content.strip()
+    if not content:
+        return True
+
+    if content.lower() in ("cancel", "stop", "exit"):
+        _dm_design_sessions.pop(uid, None)
+        await message.channel.send(embed=discord.Embed(
+            description="◈ DM design cancelled. Current DM style unchanged.",
+            color=0xE63946,
+        ))
+        return True
+
+    session["history"].append({"role": "user", "content": content})
+
+    async with message.channel.typing():
+        response = await call_shadow_ai(session["history"])
+
+    if not response:
+        await message.channel.send("*Signal lost. Try again.*")
+        return True
+
+    session["history"].append({"role": "assistant", "content": response})
+
+    # Check for save block
+    match = re.search(r"```json\s*(\{.*?\})\s*```", response, re.DOTALL)
+    saved = False
+    clean_response = response
+
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            if data.get("save_dm"):
+                db_fn = session.get("get_db_fn") or get_db_fn
+                await ghost_save_config(db_fn, "dm_intro_instructions", data.get("instructions", ""))
+                saved = True
+                _dm_design_sessions.pop(uid, None)
+                clean_response = re.sub(r"```json\s*\{.*?\}\s*```", "", response, flags=re.DOTALL).strip()
+                if not clean_response:
+                    clean_response = "✅ DM style saved. New members will get this custom intro from Ghost."
+        except Exception as e:
+            print(f"[DM DESIGN] JSON parse error: {e}")
+
+    color = 0x22C55E if saved else 0x7B2FBE
+    embed = discord.Embed(description=clean_response, color=color)
+    embed.set_author(name="◈ GHOST DM DESIGNER")
+    if not saved:
+        embed.set_footer(text="Keep chatting to refine · Type 'cancel' to abort")
+    await message.channel.send(embed=embed)
+    return True
+
+
+def dm_design_is_active(uid: str) -> bool:
+    sess = _dm_design_sessions.get(uid)
     return bool(sess and sess["active"])
