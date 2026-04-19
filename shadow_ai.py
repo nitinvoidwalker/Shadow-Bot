@@ -1113,15 +1113,44 @@ async def ghost_save_config(get_db_fn, key: str, value):
 
 # ── Fallback knowledge if DB is empty ─────────────────────────────
 _GHOST_FALLBACK_KNOWLEDGE = """
-=== SHADOWSEEKERS ORDER — OVERVIEW ===
-High-performance study and accountability server. Members are Operatives.
-The server tracks daily objectives, study sessions, and Echoes (XP/currency).
+=== SHADOWSEEKERS ORDER — IDENTITY ===
+ShadowSeekers is a discipline-first ecosystem where users are not casual members but individuals committed to structured growth, deep work, and exam mastery. The environment is designed for serious aspirants who value execution over intention and consistency over bursts of motivation.
+
+=== PHILOSOPHY ===
+The system operates on core principles: discipline over motivation, systems over luck, execution over planning, and identity over temporary effort. Every action inside the server is aligned with long-term consistency, not short-term hype.
+
+=== WHO IS A SHADOWSEEKER ===
+A ShadowSeeker is expected to show up daily, track their work, follow structured study systems, and avoid distractions. Low-effort behavior, excuses, and passive participation are discouraged. The ultimate objective is to transform users into disciplined individuals capable of consistent execution, high performance in exams, and long-term personal mastery.
+
+=== DEEP WORK SYSTEM ===
+The foundation of productivity is deep work — focused, distraction-free study sessions with clear targets. Users are encouraged to time-block their day and execute without interruptions.
+
+=== SPEED DRILLS ===
+Speed Drills are structured practice sessions where users attempt chapter-wise questions in a timed format (e.g., 25 questions in 30 minutes), focusing on accuracy and speed under pressure.
+
+=== SHADOW QUIZ ===
+Shadow Quiz is a recurring test system based on real exam-level questions, designed to improve recall speed, concept clarity, and performance consistency.
+
+=== ECHOES ECONOMY ===
+Echoes are a virtual currency earned strictly through effort — study time, consistency, and task completion. There are no passive rewards. Rewards require sustained effort over 15–25 days, reinforcing discipline and long-term engagement.
+
+=== CHARACTER SYSTEM ===
+Users align with identities: Nyx (discipline), Kairo (systems), Lyra (creativity), Draven (execution), Astra (vision) — helping build a stronger personal identity within the system.
+
+=== ONBOARDING ===
+New users introduce themselves with structured fields (name, exam, target, weak areas, study hours) and immediately enter the system by reporting daily goals. First step: /link your Shadow ID.
+
+=== COMMUNICATION STYLE ===
+Communication is minimal, direct, and purpose-driven. No unnecessary conversation, no fluff — only clarity, guidance, and execution-focused interaction.
+
+=== ECHO RANKS ===
+Initiate (0) → Seeker (500) → Phantom (1500) → Wraith (3000) → Voidborn (5000)
 
 === CORE COMMANDS ===
 /link <shadow_id> <n>  — Bind your identity. First thing to do.
 /todo add <objective>  — Log a daily objective.
 /op add <obj#> <task>  — Sub-task under an objective.
-/study [task]          — Start a study session, earn Echoes.
+/study [task]          — Start a focus session, earn Echoes.
 /pomodoro [task]       — 25-minute focused block.
 /endsession            — End session, submit proof.
 /echoes                — Your echo count and rank.
@@ -1130,13 +1159,11 @@ The server tracks daily objectives, study sessions, and Echoes (XP/currency).
 /setfocuswindow <hr>   — Daily Phantom Alert reminder.
 /exam add <n> [date]   — Track upcoming exams.
 
-=== ECHO RANKS ===
-Initiate (0) → Seeker (500) → Phantom (1500) → Wraith (3000) → Voidborn (5000)
-
 === RULES ===
 1. Respect all operatives.
 2. Submit real proof when ending sessions — no fake logs.
 3. Link your Shadow ID before using most features.
+4. No spam, distractions, or unproductive behavior.
 """.strip()
 
 
@@ -1167,22 +1194,139 @@ SERVER KNOWLEDGE BASE (your only source of truth):
 
 
 _TRAIN_SYSTEM_PROMPT = """You are a knowledge extraction assistant for the ShadowSeekers Discord bot.
-Your job is to interview an admin and extract structured knowledge about their server to train the Ghost onboarding AI.
+Your job is to help an admin save structured knowledge docs for the Ghost onboarding AI.
 
 HOW TO BEHAVE:
-- Start by asking what topic they want to add (rules, commands, culture, schedule, anything).
-- Then ask them to describe it — or let them paste raw text.
-- If they paste raw text, acknowledge it and ask if they want to add more or confirm saving.
-- If they describe it conversationally, ask follow-up questions to make sure it's complete.
-- When you have enough for a doc, output a JSON block ONLY when the admin says they're done or confirms:
-  ```json
-  {"save_doc": true, "doc_id": "short_key", "title": "Human Title", "content": "Full content here...", "order": 1}
-  ```
-- doc_id must be lowercase, underscores only, no spaces (e.g. "server_rules", "echo_system").
-- content should be clean, factual, well-structured text — not a conversation transcript.
-- After saving one doc, ask if they want to add another topic or type "done" to finish.
-- Keep your messages short and focused. You're a data collector, not a chatbot.
-- NEVER make up server information. Only use what the admin tells you."""
+- The admin will paste raw text or describe topics. Your ONLY job is to clean and structure what they give you.
+- When the admin pastes content, IMMEDIATELY output a JSON save block. Do NOT ask questions first.
+- Always output the JSON block in your very first response after receiving content.
+- Format the content cleanly — remove numbering artifacts, fix structure, make it readable.
+- Use a sensible doc_id based on the content (e.g. "server_identity", "echo_system", "onboarding").
+- Output format (always wrap in ```json ```):
+  {"save_doc": true, "doc_id": "short_key", "title": "Human Title", "content": "Full clean content here...", "order": 1}
+- After saving, ask if they want to add another doc or type "done" to finish.
+- NEVER refuse to save. NEVER ask for confirmation before outputting the JSON block.
+- If content is large, split into multiple logical docs and output multiple JSON blocks.
+- NEVER make up information. Only use what the admin provides."""
+
+
+async def train_start(interaction: discord.Interaction, get_db_fn):
+    """Start a /train session."""
+    uid = str(interaction.user.id)
+
+    _train_sessions[uid] = {
+        "active":   True,
+        "history":  [{"role": "system", "content": _TRAIN_SYSTEM_PROMPT}],
+        "get_db_fn": get_db_fn,
+        "docs_saved": 0,
+    }
+
+    embed = discord.Embed(
+        title="◈ GHOST TRAINING SESSION INITIATED",
+        description=(
+            "Paste your server knowledge below and I'll save it to Ghost's knowledge base immediately.\n\n"
+            "You can paste:\n"
+            "◈ Raw text about your server, rules, systems, philosophy\n"
+            "◈ Multiple topics at once — I'll split them intelligently\n\n"
+            "*Type `done` when finished.*"
+        ),
+        color=0xA855F7,
+    )
+    embed.set_footer(text="Paste content now · Type 'done' to finish · /train stop to cancel")
+    await interaction.response.send_message(embed=embed)
+
+
+async def train_handle_message(message: discord.Message, get_db_fn) -> bool:
+    """
+    Called from on_message for channel messages during an active /train session.
+    Returns True if handled.
+    """
+    uid     = str(message.author.id)
+    session = _train_sessions.get(uid)
+    if not session or not session["active"]:
+        return False
+
+    content = message.content.strip()
+    if not content:
+        return True
+
+    # "done" → end session
+    if content.lower() in ("done", "/done", "exit", "/train stop"):
+        docs_saved = session.get("docs_saved", 0)
+        _train_sessions.pop(uid, None)
+        await message.channel.send(embed=discord.Embed(
+            title="◈ TRAINING SESSION CLOSED",
+            description=(
+                f"**{docs_saved} doc(s)** saved to Ghost's knowledge base.\n"
+                "New members will now be guided with this information.\n\n"
+                "Use `/train list` to see everything saved."
+            ),
+            color=0xF0A500,
+        ))
+        return True
+
+    # Add to history and call AI
+    session["history"].append({"role": "user", "content": content})
+
+    # Trim history
+    sys_msgs   = [m for m in session["history"] if m["role"] == "system"]
+    convo_msgs = [m for m in session["history"] if m["role"] != "system"]
+    if len(convo_msgs) > 40:
+        convo_msgs = convo_msgs[-40:]
+    session["history"] = sys_msgs + convo_msgs
+
+    async with message.channel.typing():
+        response = await call_shadow_ai(session["history"])
+
+    if not response:
+        await message.channel.send("*Signal lost. Try again.*")
+        return True
+
+    session["history"].append({"role": "assistant", "content": response})
+
+    # ── Detect and save ALL JSON doc blocks in response ───────────
+    all_matches = re.findall(r"```json\s*(\{.*?\})\s*```", response, re.DOTALL)
+    saved_titles = []
+
+    for raw_json in all_matches:
+        try:
+            data = json.loads(raw_json)
+            if data.get("save_doc"):
+                ok = await ghost_save_knowledge_doc(
+                    get_db_fn,
+                    doc_id  = data.get("doc_id", "doc"),
+                    title   = data.get("title", "Untitled"),
+                    content = data.get("content", ""),
+                    order   = data.get("order", 99),
+                )
+                if ok:
+                    saved_titles.append(data.get("title", "Doc"))
+                    session["docs_saved"] = session.get("docs_saved", 0) + 1
+        except Exception as e:
+            print(f"[GHOST TRAIN] JSON parse error: {e}")
+
+    # Strip all JSON blocks from visible response
+    clean_response = re.sub(r"```json\s*\{.*?\}\s*```", "", response, flags=re.DOTALL).strip()
+
+    # Build reply
+    if saved_titles:
+        saved_lines = "\n".join(f"◈ **{t}**" for t in saved_titles)
+        clean_response = (clean_response + f"\n\n✅ Saved to Ghost's knowledge base:\n{saved_lines}").strip()
+    elif not clean_response:
+        clean_response = "Processing complete."
+
+    await message.channel.send(embed=discord.Embed(
+        description=clean_response,
+        color=0xA855F7,
+    ).set_author(name="◈ GHOST TRAINING").set_footer(text="Paste more content · Type 'done' when finished"))
+    return True
+
+
+def train_is_active(uid: str) -> bool:
+    sess = _train_sessions.get(uid)
+    return bool(sess and sess["active"])
+
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1446,116 +1590,6 @@ def ghost_close_session(uid: str):
 # /TRAIN — ADMIN KNOWLEDGE BUILDER
 # ══════════════════════════════════════════════════════════════════
 
-async def train_start(interaction: discord.Interaction, get_db_fn):
-    """Start a /train session — AI interviews the admin to build knowledge docs."""
-    uid = str(interaction.user.id)
-
-    # Kick off fresh train session
-    _train_sessions[uid] = {
-        "active":  True,
-        "history": [
-            {"role": "system", "content": _TRAIN_SYSTEM_PROMPT},
-        ],
-        "get_db_fn": get_db_fn,
-    }
-
-    opener_prompt = "Begin the interview. Ask the admin what topic they want to add to the Ghost knowledge base."
-    _train_sessions[uid]["history"].append({"role": "user", "content": opener_prompt})
-
-    async with interaction.channel.typing():
-        response = await call_shadow_ai(_train_sessions[uid]["history"])
-
-    if not response:
-        response = "What topic do you want to add to Ghost's knowledge base? (e.g. server rules, echo system, culture)"
-
-    _train_sessions[uid]["history"].append({"role": "assistant", "content": response})
-
-    embed = discord.Embed(
-        title="◈ GHOST TRAINING SESSION INITIATED",
-        description=response,
-        color=0xA855F7,
-    )
-    embed.set_footer(text="Type your answers here · Type 'done' to end the session · /train stop to cancel")
-    await interaction.response.send_message(embed=embed)
-
-
-async def train_handle_message(message: discord.Message, get_db_fn) -> bool:
-    """
-    Called from on_message for channel messages during an active /train session.
-    Returns True if handled.
-    """
-    uid     = str(message.author.id)
-    session = _train_sessions.get(uid)
-    if not session or not session["active"]:
-        return False
-
-    content = message.content.strip()
-    if not content:
-        return True
-
-    # "done" → end session
-    if content.lower() in ("done", "/done", "exit", "/train stop"):
-        _train_sessions.pop(uid, None)
-        embed = discord.Embed(
-            title="◈ TRAINING SESSION CLOSED",
-            description="Ghost's knowledge base has been updated. New members will now be guided with this information.",
-            color=0xF0A500,
-        )
-        await message.channel.send(embed=embed)
-        return True
-
-    session["history"].append({"role": "user", "content": content})
-
-    # Trim to 60 exchanges
-    sys_msgs   = [m for m in session["history"] if m["role"] == "system"]
-    convo_msgs = [m for m in session["history"] if m["role"] != "system"]
-    if len(convo_msgs) > 60:
-        convo_msgs = convo_msgs[-60:]
-    session["history"] = sys_msgs + convo_msgs
-
-    async with message.channel.typing():
-        response = await call_shadow_ai(session["history"])
-
-    if not response:
-        await message.channel.send("*Signal lost. Try again.*")
-        return True
-
-    session["history"].append({"role": "assistant", "content": response})
-
-    # ── Detect and save JSON doc block ────────────────────────────
-    import re as _re
-    match = _re.search(r"```json\s*(\{.*?\})\s*```", response, _re.DOTALL)
-    saved_doc = None
-    if match:
-        try:
-            import json as _json
-            data = _json.loads(match.group(1))
-            if data.get("save_doc"):
-                ok = await ghost_save_knowledge_doc(
-                    get_db_fn,
-                    doc_id  = data.get("doc_id", "doc"),
-                    title   = data.get("title", "Untitled"),
-                    content = data.get("content", ""),
-                    order   = data.get("order", 99),
-                )
-                saved_doc = data.get("title", "Doc") if ok else None
-                # Strip raw JSON from what we show the admin
-                response = _re.sub(r"```json\s*\{.*?\}\s*```", "", response, flags=_re.DOTALL).strip()
-                if saved_doc:
-                    response += f"\n\n*◈ **{saved_doc}** saved to Ghost's knowledge base.*"
-        except Exception as e:
-            print(f"[GHOST TRAIN] JSON parse error: {e}")
-
-    embed = discord.Embed(description=response, color=0xA855F7)
-    embed.set_author(name="◈ GHOST TRAINING")
-    embed.set_footer(text="Continue adding info · Type 'done' when finished")
-    await message.channel.send(embed=embed)
-    return True
-
-
-def train_is_active(uid: str) -> bool:
-    sess = _train_sessions.get(uid)
-    return bool(sess and sess["active"])
 
 
 async def train_stop(interaction: discord.Interaction):
