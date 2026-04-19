@@ -311,7 +311,19 @@ You will receive a context block at the start of each conversation showing the o
 RESPONSE LENGTH:
 - Keep responses tight. 1-4 sentences for most replies.
 - Longer only for plans or detailed breakdowns.
-- Never ramble."""
+- Never ramble.
+
+ADDING TASKS TO DOSSIER:
+- When an operative asks you to add tasks, create a plan, or suggests things they need to do — output a ```tasks``` block with one task per line.
+- Example: if they say "add DSA revision, OS notes, mock test to my todo" respond normally AND include:
+  ```tasks
+  DSA revision
+  OS notes
+  Mock test
+  ```
+- The system will automatically save these to their actual dossier. Do NOT say "I've added these" unless the block is present.
+- For single tasks, still use the block — one line inside it.
+- Only use this block when the operative explicitly wants tasks saved. Don't add tasks for casual conversation."""
 
 PLAN_NEW_PROMPT = """The operative has used /plan new. Begin the plan-building flow immediately.
 Start with one sharp question: what are they working towards? Do not greet them. Just start."""
@@ -533,7 +545,7 @@ async def start_plan_revise(message: discord.Message, load_data_fn, get_db_fn):
 # ══════════════════════════════════════════════════════════════════
 # ☽  SHADOW TODO — @shadowbot inline todo management
 #
-#  @shadowbot add task <text>
+#  @shadowbot add task1, task2, task3   — adds each as separate task
 #  @shadowbot remove task <n>
 #  @shadowbot done task <n>
 #  @shadowbot undone task <n>
@@ -542,16 +554,24 @@ async def start_plan_revise(message: discord.Message, load_data_fn, get_db_fn):
 #  @shadowbot clear tasks
 #
 #  Token-free — bypasses the token economy entirely.
+#  AI chat can also add tasks by outputting a ```tasks``` block.
 # ══════════════════════════════════════════════════════════════════
 
 _TODO_PATTERNS = [
-    (re.compile(r"^(?:add|add task|new task|create task)\s+(.+)$", re.I),                           "add"),
-    (re.compile(r"^(?:remove|delete|remove task|delete task)\s+(?:task\s+)?#?(\d+)$", re.I),        "remove"),
+    # add — captures everything after the trigger (comma-separated = multiadd)
+    (re.compile(r"^(?:add|add tasks?|new tasks?|create tasks?)\s+(.+)$", re.I),                     "add"),
+    # remove / delete
+    (re.compile(r"^(?:remove|delete|remove tasks?|delete tasks?)\s+(?:task\s+)?#?(\d+)$", re.I),    "remove"),
+    # done
     (re.compile(r"^(?:done|complete|finish|tick)\s+(?:task\s+)?#?(\d+)$", re.I),                    "done"),
     (re.compile(r"^mark\s+(?:task\s+)?#?(\d+)\s+(?:as\s+)?done$", re.I),                           "done"),
+    # undone
     (re.compile(r"^(?:undone|uncheck|mark undone|incomplete)\s+(?:task\s+)?#?(\d+)$", re.I),        "undone"),
+    # edit
     (re.compile(r"^(?:edit|rename|update)\s+(?:task\s+)?#?(\d+)\s+(?:to\s+)?(.+)$", re.I),         "edit"),
+    # list
     (re.compile(r"^(?:list tasks?|todo list|show tasks?|show todos?|my tasks?|tasks?)$", re.I),     "list"),
+    # clear
     (re.compile(r"^(?:clear tasks?|clear todos?|wipe tasks?|delete all tasks?)$", re.I),            "clear"),
 ]
 
@@ -564,7 +584,9 @@ def _parse_todo_command(content: str):
         if m:
             g = m.groups()
             if action == "add":
-                return "add", {"text": g[0].strip()}
+                # Split by comma — single item = normal add, multiple = multiadd
+                items = [t.strip() for t in g[0].split(",") if t.strip()]
+                return "add", {"tasks": items}
             elif action == "remove":
                 return "remove", {"index": int(g[0])}
             elif action == "done":
@@ -572,7 +594,7 @@ def _parse_todo_command(content: str):
             elif action == "undone":
                 return "undone", {"index": int(g[0])}
             elif action == "edit":
-                return "edit", {"index": int(g[0]), "text": g[1].strip()}
+                return "edit", {"index": int(g[0]), "task": g[1].strip()}
             elif action == "list":
                 return "list", {}
             elif action == "clear":
@@ -581,6 +603,7 @@ def _parse_todo_command(content: str):
 
 
 def _get_todo_helpers():
+    """Grab helpers from main bot module — same pattern as ai_missions."""
     import sys
     main_mod = sys.modules.get("__main__")
     if not main_mod:
@@ -590,9 +613,36 @@ def _get_todo_helpers():
         main_mod.save_data,
         main_mod.set_todos_for_date,
         main_mod.get_todos_for_date,
+        main_mod.get_active_date,   # respects /todo date switching
         main_mod.today_str,
         main_mod.get_shadow_id,
     )
+
+
+async def _save_tasks_to_dossier(uid: str, task_list: list[str], load_data_fn, save_data_fn) -> tuple[bool, list, str]:
+    """
+    Core helper — saves a list of task strings to the operative's active dossier.
+    Returns (success, saved_tasks, active_date).
+    Used by both handle_todo_command and the AI task-save flow.
+    """
+    try:
+        _, _, set_todos_for_date, get_todos_for_date, get_active_date_fn, today_str_fn, get_shadow_id_fn = _get_todo_helpers()
+    except Exception:
+        return False, [], ""
+
+    data = await load_data_fn()
+
+    if not get_shadow_id_fn(uid, data):
+        return False, [], ""
+
+    active = get_active_date_fn(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+
+    new_entries = [{"task": t, "done": False, "priority": None} for t in task_list]
+    todos.extend(new_entries)
+    set_todos_for_date(uid, active, todos, data)
+    await save_data_fn(data)
+    return True, task_list, active
 
 
 async def handle_todo_command(
@@ -605,7 +655,7 @@ async def handle_todo_command(
     uid = str(message.author.id)
 
     try:
-        _, _, set_todos_for_date, get_todos_for_date, today_str_fn, get_shadow_id_fn = _get_todo_helpers()
+        _, _, set_todos_for_date, get_todos_for_date, get_active_date_fn, today_str_fn, get_shadow_id_fn = _get_todo_helpers()
     except Exception as e:
         await message.reply(embed=discord.Embed(
             title="▲ SYSTEM ERROR",
@@ -614,8 +664,9 @@ async def handle_todo_command(
         ))
         return False
 
-    data  = await load_data_fn()
-    today = today_str_fn()
+    data   = await load_data_fn()
+    active = get_active_date_fn(uid, data)
+    today  = today_str_fn()
 
     shadow_id = get_shadow_id_fn(uid, data)
     if not shadow_id:
@@ -626,24 +677,40 @@ async def handle_todo_command(
         ))
         return False
 
-    tasks = get_todos_for_date(uid, today, data)
+    tasks = get_todos_for_date(uid, active, data)
+    is_today  = active == today
+    date_note = "" if is_today else f" *(for {active})*"
 
+    # ── ADD (single or multi) ─────────────────────────────────────
     if action == "add":
-        tasks.append({"text": args["text"], "done": False, "ops": [], "priority": "p2", "source": "shadow_mention"})
-        set_todos_for_date(uid, today, tasks, data)
+        task_list   = args["tasks"]
+        start_count = len(tasks)
+        for t in task_list:
+            tasks.append({"task": t, "done": False, "priority": None})
+        set_todos_for_date(uid, active, tasks, data)
         await save_data_fn(data)
-        await message.reply(embed=discord.Embed(
-            title="◈ TASK ADDED",
-            description=f"**#{len(tasks)}** — {args['text']}\n\nView: `/todo list`",
-            color=0x10B981,
-        ))
+
+        if len(task_list) == 1:
+            await message.reply(embed=discord.Embed(
+                title="◈ OBJECTIVE ADDED",
+                description=f"**#{start_count + 1}**{date_note} — {task_list[0]}\n\nView: `/todo list`",
+                color=0x10B981,
+            ))
+        else:
+            lines = [f"**#{start_count + i + 1}** · *{t}*" for i, t in enumerate(task_list)]
+            await message.reply(embed=discord.Embed(
+                title=f"◈ {len(task_list)} OBJECTIVES ADDED",
+                description="\n".join(lines) + f"{date_note}\n\nView: `/todo list`",
+                color=0x10B981,
+            ))
         return True
 
+    # ── LIST ──────────────────────────────────────────────────────
     elif action == "list":
         if not tasks:
             await message.reply(embed=discord.Embed(
                 title="◈ DOSSIER CLEAR",
-                description="No objectives logged today.\nAdd one: `@shadowbot add task <objective>`",
+                description=f"No objectives for **{active}**{' (today)' if is_today else ''}.\nAdd one: `@shadowbot add task <objective>`",
                 color=0x7B2FBE,
             ))
             return True
@@ -652,40 +719,44 @@ async def handle_todo_command(
             status  = "✅" if t.get("done") else "⬜"
             ops     = t.get("ops", [])
             ops_str = f" `({sum(1 for o in ops if o.get('done'))}/{len(ops)} ops)`" if ops else ""
-            lines.append(f"{status} **#{i}** — {t.get('text','?')}{ops_str}")
+            lines.append(f"{status} **#{i}** — {t.get('task', t.get('text', '?'))}{ops_str}")
         done_count = sum(1 for t in tasks if t.get("done"))
+        title = f"◈ TODAY'S DOSSIER — {active}" if is_today else f"◈ DOSSIER — {active}"
         await message.reply(embed=discord.Embed(
-            title=f"◈ TODAY'S DOSSIER — {today}",
+            title=title,
             description="\n".join(lines) + f"\n\n*{done_count}/{len(tasks)} complete*",
             color=0x7B2FBE,
         ))
         return True
 
+    # ── REMOVE ────────────────────────────────────────────────────
     elif action == "remove":
         n = args["index"]
         if n < 1 or n > len(tasks):
             await message.reply(embed=discord.Embed(
                 title="▲ INVALID TASK",
-                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) today.",
+                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) on {active}.",
                 color=0xE63946,
             ))
             return False
         removed = tasks.pop(n - 1)
-        set_todos_for_date(uid, today, tasks, data)
+        set_todos_for_date(uid, active, tasks, data)
         await save_data_fn(data)
+        removed_text = removed.get("task", removed.get("text", "?"))
         await message.reply(embed=discord.Embed(
             title="◈ TASK REMOVED",
-            description=f"~~{removed.get('text','?')}~~ — wiped from your dossier.",
+            description=f"~~{removed_text}~~ — wiped from your dossier.",
             color=0xF0A500,
         ))
         return True
 
+    # ── DONE ──────────────────────────────────────────────────────
     elif action == "done":
         n = args["index"]
         if n < 1 or n > len(tasks):
             await message.reply(embed=discord.Embed(
                 title="▲ INVALID TASK",
-                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) today.",
+                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) on {active}.",
                 color=0xE63946,
             ))
             return False
@@ -697,67 +768,101 @@ async def handle_todo_command(
             ))
             return True
         tasks[n - 1]["done"] = True
-        set_todos_for_date(uid, today, tasks, data)
+        set_todos_for_date(uid, active, tasks, data)
         await save_data_fn(data)
-        done_count = sum(1 for t in tasks if t.get("done"))
+        done_count  = sum(1 for t in tasks if t.get("done"))
+        task_text   = tasks[n - 1].get("task", tasks[n - 1].get("text", "?"))
         await message.reply(embed=discord.Embed(
             title="✅ OBJECTIVE COMPLETE",
-            description=f"**#{n}** — {tasks[n-1].get('text','?')}\n\n*{done_count}/{len(tasks)} complete today.*",
+            description=f"**#{n}** — {task_text}\n\n*{done_count}/{len(tasks)} complete today.*",
             color=0x10B981,
         ))
         return True
 
+    # ── UNDONE ────────────────────────────────────────────────────
     elif action == "undone":
         n = args["index"]
         if n < 1 or n > len(tasks):
             await message.reply(embed=discord.Embed(
                 title="▲ INVALID TASK",
-                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) today.",
+                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) on {active}.",
                 color=0xE63946,
             ))
             return False
         tasks[n - 1]["done"] = False
-        set_todos_for_date(uid, today, tasks, data)
+        set_todos_for_date(uid, active, tasks, data)
         await save_data_fn(data)
+        task_text = tasks[n - 1].get("task", tasks[n - 1].get("text", "?"))
         await message.reply(embed=discord.Embed(
             title="◈ TASK REOPENED",
-            description=f"**#{n}** — {tasks[n-1].get('text','?')} — marked incomplete.",
+            description=f"**#{n}** — {task_text} — marked incomplete.",
             color=0xF0A500,
         ))
         return True
 
+    # ── EDIT ──────────────────────────────────────────────────────
     elif action == "edit":
         n = args["index"]
         if n < 1 or n > len(tasks):
             await message.reply(embed=discord.Embed(
                 title="▲ INVALID TASK",
-                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) today.",
+                description=f"Task #{n} doesn't exist. You have {len(tasks)} task(s) on {active}.",
                 color=0xE63946,
             ))
             return False
-        old_text = tasks[n - 1].get("text", "?")
-        tasks[n - 1]["text"] = args["text"]
-        set_todos_for_date(uid, today, tasks, data)
+        old_text = tasks[n - 1].get("task", tasks[n - 1].get("text", "?"))
+        tasks[n - 1]["task"] = args["task"]
+        tasks[n - 1].pop("text", None)  # clean up old key if present
+        set_todos_for_date(uid, active, tasks, data)
         await save_data_fn(data)
         await message.reply(embed=discord.Embed(
             title="◈ TASK UPDATED",
-            description=f"**#{n}** updated:\n~~{old_text}~~\n→ {args['text']}",
+            description=f"**#{n}** updated:\n~~{old_text}~~\n→ {args['task']}",
             color=0x7B2FBE,
         ))
         return True
 
+    # ── CLEAR ─────────────────────────────────────────────────────
     elif action == "clear":
         count = len(tasks)
-        set_todos_for_date(uid, today, [], data)
+        set_todos_for_date(uid, active, [], data)
         await save_data_fn(data)
         await message.reply(embed=discord.Embed(
             title="◈ DOSSIER WIPED",
-            description=f"All {count} task(s) cleared from today's dossier.",
+            description=f"All {count} task(s) cleared from **{active}**.",
             color=0xF0A500,
         ))
         return True
 
     return False
+
+
+async def _try_save_ai_tasks(uid: str, response: str, message: discord.Message, load_data_fn, save_data_fn):
+    """
+    If the AI response contains a ```tasks``` block, parse and save those tasks
+    to the operative's dossier, then append a confirmation to the response.
+    Returns the (possibly modified) response string.
+    """
+    match = re.search(r"```tasks\s*([\s\S]*?)```", response, re.IGNORECASE)
+    if not match:
+        return response
+
+    raw = match.group(1).strip()
+    task_list = [t.lstrip("-•*123456789. ").strip() for t in raw.splitlines() if t.strip()]
+    task_list = [t for t in task_list if t]
+
+    if not task_list:
+        return response
+
+    ok, saved, active = await _save_tasks_to_dossier(uid, task_list, load_data_fn, save_data_fn)
+
+    # Strip the raw ```tasks``` block from what gets shown in Discord
+    clean = re.sub(r"```tasks[\s\S]*?```", "", response, flags=re.IGNORECASE).strip()
+
+    if ok:
+        lines = "\n".join(f"◈ {t}" for t in saved)
+        clean += f"\n\n*▲ Added to your dossier ({active}):*\n{lines}"
+    return clean
 
 
 # ── MAIN HANDLER (mention) ────────────────────────────────────────
@@ -847,6 +952,10 @@ async def handle_mention(
 
     _conversations[uid].append({"role": "assistant", "content": response})
     asyncio.create_task(gas_save_convo(uid, _conversations[uid]))
+
+    # ── Save any tasks the AI included in a ```tasks``` block ─────
+    if "```tasks" in response.lower():
+        response = await _try_save_ai_tasks(uid, response, message, load_data_fn, save_data_fn)
 
     # ── Check if this is a plan response ─────────────────────────
     plan_saved = False
