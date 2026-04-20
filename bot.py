@@ -3359,7 +3359,7 @@ welcome_group = app_commands.Group(name="setwelcome", description="Admin: custom
 tree.add_command(welcome_group)
 
 
-@welcome_group.command(name="format", description="Choose a welcome style: 1=Operative Briefing, 2=Shadow Initiation, 3=Grind Culture, 4=Ghost Intel Drop, custom=AI-designed")
+@welcome_group.command(name="format", description="Set welcome style: 1-4 presets or 'custom' to design via AI chat")
 @app_commands.describe(number="Format number 1–4, or 'custom' to design your own via AI chat")
 async def setwelcome_format_cmd(interaction: discord.Interaction, number: str):
     if not _is_admin(interaction):
