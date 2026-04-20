@@ -1563,7 +1563,7 @@ async def todo_done(interaction: discord.Interaction, numbers: str):
     completed = []
     for n in indices:
         todos[n - 1]["done"] = True
-        completed.append(todos[n - 1]["task"])
+        completed.append(todos[n - 1].get("task") or todos[n - 1].get("text", f"Objective #{n}"))
 
     set_todos_for_date(uid, active, todos, data)
     await save_data(data)
@@ -2465,32 +2465,35 @@ async def leaderboard(interaction: discord.Interaction):
     name="Your operative name"
 )
 async def link(interaction: discord.Interaction, shadow_id: str, name: str):
+    # Defer immediately — admin channel notify happens before response which can exceed 3s
+    await interaction.response.defer()
+
     data     = await load_data()
     uid      = str(interaction.user.id)
     sid      = shadow_id.upper().strip()
     codename = name.strip()
 
     if get_shadow_id(uid, data):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ ALREADY LINKED", f"Already linked to `{data['links'][uid]['shadow_id']}`.", color=0xE63946),
         )
         return
 
     if not re.match(r'^SS\d{4}$', sid):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ INVALID SHADOW ID", "The format must be `SS####` — e.g. `SS0069`. Check your credentials.", color=0xE63946),
         )
         return
 
     if not codename:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=make_embed("▲ NAME REQUIRED", "You must provide your operative name to link.", color=0xE63946),
         )
         return
 
     for existing_link in data["links"].values():
         if existing_link["shadow_id"] == sid and existing_link.get("approved"):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=make_embed("▲ ID ALREADY TAKEN", f"`{sid}` is already linked to someone else. Contact an admin if this is wrong.", color=0xE63946),
             )
             return
@@ -2510,7 +2513,7 @@ async def link(interaction: discord.Interaction, shadow_id: str, name: str):
         )
         await ch.send(content=f"{role_mention} — new link request awaiting authorization.", embed=embed)
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=make_embed(
             "◈ REQUEST SENT",
             f"Your request to link `{sid}` as **{codename}** has been sent into the void.\nAwait authorization from the Order.",
@@ -3443,6 +3446,307 @@ async def setwelcome_formats_cmd(interaction: discord.Interaction):
             embed=make_embed("▲ ACCESS DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
         return
     await setwelcome_formats(interaction)
+
+
+# ══════════════════════════════════════════════════════════════════
+# /admin — Full admin control group [HIGH CLEARANCE]
+# ══════════════════════════════════════════════════════════════════
+admin_group = app_commands.Group(name="admin", description="[HIGH CLEARANCE] Full admin control over operatives and bot")
+tree.add_command(admin_group)
+
+
+@admin_group.command(name="unlink", description="Remove an operative's Shadow ID link entirely")
+@app_commands.describe(user="The operative to unlink")
+async def admin_unlink(interaction: discord.Interaction, user: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    data = await load_data()
+    uid  = str(user.id)
+    sid  = get_shadow_id(uid, data)
+    if not sid:
+        await interaction.response.send_message(
+            embed=make_embed("▲ NOT LINKED", f"**{user.display_name}** has no active link.", color=0xE63946), ephemeral=True)
+        return
+    data["links"].pop(uid, None)
+    data["pending_links"].pop(uid, None)
+    await save_data(data)
+    await interaction.response.send_message(
+        embed=make_embed("◈ UNLINKED",
+            f"**{user.display_name}** (`{sid}`) has been unlinked.\n"
+            f"They can `/link` again with a new Shadow ID.", color=0xF0A500))
+
+
+@admin_group.command(name="forcelink", description="Directly link an operative without a pending request")
+@app_commands.describe(user="The operative to link", shadow_id="Shadow ID e.g. SS0069", codename="Operative codename")
+async def admin_forcelink(interaction: discord.Interaction, user: discord.Member, shadow_id: str, codename: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    await interaction.response.defer()
+    data = await load_data()
+    uid  = str(user.id)
+    sid  = shadow_id.upper().strip()
+
+    if not re.match(r'^SS\d{4}$', sid):
+        await interaction.followup.send(embed=make_embed("▲ INVALID ID", "Format must be `SS####` — e.g. `SS0069`.", color=0xE63946))
+        return
+    if get_shadow_id(uid, data):
+        await interaction.followup.send(embed=make_embed("▲ ALREADY LINKED", f"**{user.display_name}** is already linked. Use `/admin unlink` first.", color=0xE63946))
+        return
+    for existing_link in data["links"].values():
+        if existing_link.get("shadow_id") == sid and existing_link.get("approved"):
+            await interaction.followup.send(embed=make_embed("▲ ID TAKEN", f"`{sid}` is already bound to another operative.", color=0xE63946))
+            return
+
+    data["links"][uid] = {"shadow_id": sid, "approved": True, "codename": codename.strip()}
+    data["pending_links"].pop(uid, None)
+    new_member = {"shadowId": sid, "codename": codename.strip(), "discordId": uid, "echoCount": 0, "badges": {}}
+    gas_ok = await create_member_on_gas(new_member)
+    if not any(m["shadowId"] == sid for m in data["members"]):
+        data["members"].append(new_member)
+    await save_data(data)
+    try:
+        await user.send(embed=make_embed(
+            "☽ LINK CONFIRMED",
+            f"You've been linked to `{sid}` as **{codename}** by an admin.\n"
+            f"Use `/todo` and `/echoes` to get started.", color=0x10B981))
+    except Exception:
+        pass
+    sync_note = "" if gas_ok else "\n⚠️ Shadow Records sync failed — retry `/sync`."
+    await interaction.followup.send(
+        embed=make_embed("◉ FORCE LINKED", f"**{user.display_name}** → `{sid}` as **{codename}**.{sync_note}", color=0x10B981))
+
+
+@admin_group.command(name="setexam", description="Add an exam entry for any operative")
+@app_commands.describe(user="The operative", name="Exam name e.g. JEE Advanced", date="Date MM/DD/YYYY")
+async def admin_setexam(interaction: discord.Interaction, user: discord.Member, name: str, date: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    date = date.strip()
+    if not re.match(r'^\d{2}/\d{2}/\d{4}$', date):
+        await interaction.response.send_message(embed=make_embed("▲ INVALID DATE", "Use `MM/DD/YYYY` — e.g. `05/25/2025`.", color=0xE63946))
+        return
+    try:
+        datetime.strptime(date, "%m/%d/%Y")
+    except ValueError:
+        await interaction.response.send_message(embed=make_embed("▲ INVALID DATE", f"`{date}` is not a real date.", color=0xE63946))
+        return
+    data = await load_data()
+    uid  = str(user.id)
+    if "exams" not in data:
+        data["exams"] = {}
+    if uid not in data["exams"]:
+        data["exams"][uid] = []
+    data["exams"][uid].append({"name": name.strip(), "date": date, "source": "admin"})
+    await save_data(data)
+    days = _days_until(date)
+    await interaction.response.send_message(
+        embed=make_embed("📅 EXAM SET",
+            f"Added **{name}** on `{date}` for **{user.display_name}**.\n"
+            f"⏳ {_format_exam_countdown(days)}", color=0x10B981))
+
+
+@admin_group.command(name="removeexam", description="Remove an exam from any operative's list by number")
+@app_commands.describe(user="The operative", number="Exam number from their /exam list")
+async def admin_removeexam(interaction: discord.Interaction, user: discord.Member, number: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    data  = await load_data()
+    uid   = str(user.id)
+    exams = data.get("exams", {}).get(uid, [])
+    if not exams or number < 1 or number > len(exams):
+        await interaction.response.send_message(
+            embed=make_embed("▲ NOT FOUND", f"Exam #{number} doesn't exist for **{user.display_name}**.", color=0xE63946))
+        return
+    def _sort_key(e):
+        try: return datetime.strptime(e["date"], "%m/%d/%Y")
+        except: return datetime.max
+    sorted_exams = sorted(exams, key=_sort_key)
+    removed = sorted_exams[number - 1]
+    data["exams"][uid] = [e for e in exams if not (e["name"] == removed["name"] and e["date"] == removed["date"])]
+    await save_data(data)
+    await interaction.response.send_message(
+        embed=make_embed("◈ EXAM REMOVED", f"~~{removed['name']}~~ removed from **{user.display_name}**'s list.", color=0x6B6B9A))
+
+
+@admin_group.command(name="settodo", description="Add a todo objective directly to any operative's dossier")
+@app_commands.describe(user="The operative", task="The objective text")
+async def admin_settodo(interaction: discord.Interaction, user: discord.Member, task: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    data   = await load_data()
+    uid    = str(user.id)
+    active = get_active_date(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+    todos.append({"task": task.strip(), "done": False, "priority": None, "ops": [], "source": "admin"})
+    set_todos_for_date(uid, active, todos, data)
+    await save_data(data)
+    await interaction.response.send_message(
+        embed=make_embed("◈ OBJECTIVE SET",
+            f"Added to **{user.display_name}**'s dossier:\n*{task}*\n\n"
+            f"`{len(todos)}` objective(s) total.", color=0x10B981))
+
+
+@admin_group.command(name="donetodo", description="Mark a todo as done for any operative")
+@app_commands.describe(user="The operative", number="Objective number from their dossier")
+async def admin_donetodo(interaction: discord.Interaction, user: discord.Member, number: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    data   = await load_data()
+    uid    = str(user.id)
+    active = get_active_date(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+    if not todos or number < 1 or number > len(todos):
+        await interaction.response.send_message(
+            embed=make_embed("▲ NOT FOUND", f"Objective #{number} doesn't exist for **{user.display_name}**.", color=0xE63946))
+        return
+    todos[number - 1]["done"] = True
+    set_todos_for_date(uid, active, todos, data)
+    await save_data(data)
+    task = todos[number - 1].get("task") or todos[number - 1].get("text", f"Objective #{number}")
+    await interaction.response.send_message(
+        embed=make_embed("☽ OBJECTIVE MARKED DONE",
+            f"**{user.display_name}**: ~~{task}~~\n"
+            f"`{sum(1 for t in todos if t.get('done'))}/{len(todos)}` objectives complete.", color=0x10B981))
+
+
+@admin_group.command(name="cleartodos", description="Wipe all todos for today from any operative's dossier")
+@app_commands.describe(user="The operative")
+async def admin_cleartodos(interaction: discord.Interaction, user: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    data   = await load_data()
+    uid    = str(user.id)
+    active = get_active_date(uid, data)
+    set_todos_for_date(uid, active, [], data)
+    await save_data(data)
+    await interaction.response.send_message(
+        embed=make_embed("◈ DOSSIER CLEARED",
+            f"**{user.display_name}**'s dossier for `{active}` has been wiped.", color=0x6B6B9A))
+
+
+@admin_group.command(name="viewtodos", description="View any operative's current dossier")
+@app_commands.describe(user="The operative")
+async def admin_viewtodos(interaction: discord.Interaction, user: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    data   = await load_data()
+    uid    = str(user.id)
+    active = get_active_date(uid, data)
+    todos  = get_todos_for_date(uid, active, data)
+    if not todos:
+        await interaction.response.send_message(
+            embed=make_embed(f"◈ {user.display_name}'s DOSSIER", "No objectives for today.", color=0x7B2FBE), ephemeral=True)
+        return
+    lines = []
+    for i, t in enumerate(todos, 1):
+        if not isinstance(t, dict): continue
+        text   = t.get("task") or t.get("text", "?")
+        status = "✅" if t.get("done") else "◻️"
+        badge  = " 🤖" if t.get("source") in ("ai", "admin") else ""
+        lines.append(f"{status} {i}. {text}{badge}")
+    done = sum(1 for t in todos if isinstance(t, dict) and t.get("done"))
+    await interaction.response.send_message(
+        embed=make_embed(f"◈ {user.display_name}'s DOSSIER ({active})",
+            "\n".join(lines) + f"\n\n`{done}/{len(todos)}` done", color=0xA855F7), ephemeral=True)
+
+
+@admin_group.command(name="listlinks", description="Show all linked operatives and their Shadow IDs")
+async def admin_listlinks(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    data  = await load_data()
+    links = [(uid, l) for uid, l in data["links"].items() if l.get("approved")]
+    if not links:
+        await interaction.response.send_message(
+            embed=make_embed("◈ NO LINKS", "No approved links found.", color=0x7B2FBE), ephemeral=True)
+        return
+    lines = []
+    for uid, l in sorted(links, key=lambda x: x[1].get("shadow_id", "")):
+        member = interaction.guild.get_member(int(uid))
+        dname  = member.display_name if member else f"Unknown ({uid})"
+        lines.append(f"`{l['shadow_id']}` **{l.get('codename','?')}** — {dname}")
+    # Chunk if too long for one embed
+    chunks, chunk = [], []
+    for line in lines:
+        chunk.append(line)
+        if len("\n".join(chunk)) > 3800:
+            chunks.append("\n".join(chunk[:-1]))
+            chunk = [line]
+    chunks.append("\n".join(chunk))
+    for i, text in enumerate(chunks):
+        title = f"◈ LINKED OPERATIVES ({len(links)} total)" if i == 0 else "◈ cont."
+        if i == 0:
+            await interaction.response.send_message(embed=make_embed(title, text, color=0xA855F7), ephemeral=True)
+        else:
+            await interaction.followup.send(embed=make_embed(title, text, color=0xA855F7), ephemeral=True)
+
+
+@admin_group.command(name="announce", description="Send a message to all members with a specific role (DM or channel)")
+@app_commands.describe(
+    role="The role to target",
+    message="The message to send",
+    channel="Post in channel instead of DMs (leave blank to DM everyone)"
+)
+async def admin_announce(interaction: discord.Interaction, role: discord.Role, message: str, channel: discord.TextChannel = None):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    targets = [m for m in interaction.guild.members if role in m.roles and not m.bot]
+    if not targets:
+        await interaction.followup.send(
+            embed=make_embed("▲ NO MEMBERS", f"No members found with role **{role.name}**.", color=0xE63946), ephemeral=True)
+        return
+
+    embed = discord.Embed(description=message, color=0xA855F7)
+    embed.set_author(name=f"☽ {interaction.user.display_name} · ShadowSeekers Order")
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
+
+    if channel:
+        await channel.send(content=role.mention, embed=embed)
+        await interaction.followup.send(
+            embed=make_embed("◉ ANNOUNCED",
+                f"Posted in {channel.mention} pinging **{role.name}** ({len(targets)} members).", color=0x10B981), ephemeral=True)
+    else:
+        sent, failed = 0, 0
+        for m in targets:
+            try:
+                await m.send(embed=embed)
+                sent += 1
+            except Exception:
+                failed += 1
+        note = f"\n⚠️ {failed} member(s) have DMs closed." if failed else ""
+        await interaction.followup.send(
+            embed=make_embed("◉ DMs SENT",
+                f"Delivered to **{sent}/{len(targets)}** members with role **{role.name}**.{note}", color=0x10B981), ephemeral=True)
+
+
+@admin_group.command(name="dm", description="Send a direct message to a specific operative from the bot")
+@app_commands.describe(user="The operative to DM", message="The message to send")
+async def admin_dm(interaction: discord.Interaction, user: discord.Member, message: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message(embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    embed = discord.Embed(description=message, color=0xA855F7)
+    embed.set_author(name=f"☽ {interaction.user.display_name} · ShadowSeekers Order")
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · DEEP IN THE DARK, I DON'T NEED THE LIGHT")
+    try:
+        await user.send(embed=embed)
+        await interaction.response.send_message(
+            embed=make_embed("◉ DM SENT", f"Message delivered to **{user.display_name}**.", color=0x10B981), ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            embed=make_embed("▲ DM FAILED", f"**{user.display_name}** has DMs closed.", color=0xE63946), ephemeral=True)
 
 
 @bot.event
