@@ -1,0 +1,484 @@
+import { useState, useEffect, useRef } from "react";
+
+// ── MOCK DATA — replace with real GAS/API fetch ───────────────────
+const MOCK_ECHOES = [
+  { id: "1", codename: "VOIDWALKER", shadowId: "SS0001", echoes: 8420, avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=void&backgroundColor=7B2FBE" },
+  { id: "2", codename: "PHANTOM_X",  shadowId: "SS0023", echoes: 6850, avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=phantom&backgroundColor=E63946" },
+  { id: "3", codename: "KESHAVA",    shadowId: "SS0069", echoes: 5210, avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=kesh&backgroundColor=F0A500" },
+  { id: "4", codename: "WRAITH_07",  shadowId: "SS0012", echoes: 4100, avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=wraith&backgroundColor=10B981" },
+  { id: "5", codename: "NOCTIS",     shadowId: "SS0044", echoes: 3380, avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=noct&backgroundColor=A855F7" },
+  { id: "6", codename: "SILENTONE",  shadowId: "SS0031", echoes: 2750, avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=silent&backgroundColor=6B6B9A" },
+  { id: "7", codename: "DRIFTER",    shadowId: "SS0088", echoes: 1900, avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=drift&backgroundColor=E63946" },
+  { id: "8", codename: "INITIATE_9", shadowId: "SS0099", echoes: 950,  avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=init&backgroundColor=7B2FBE" },
+];
+
+const MOCK_VC = [
+  { id: "3", codename: "KESHAVA",    shadowId: "SS0069", vcHours: 142.5, avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=kesh&backgroundColor=F0A500" },
+  { id: "1", codename: "VOIDWALKER", shadowId: "SS0001", vcHours: 118.2, avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=void&backgroundColor=7B2FBE" },
+  { id: "5", codename: "NOCTIS",     shadowId: "SS0044", vcHours: 97.8,  avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=noct&backgroundColor=A855F7" },
+  { id: "2", codename: "PHANTOM_X",  shadowId: "SS0023", vcHours: 84.1,  avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=phantom&backgroundColor=E63946" },
+  { id: "4", codename: "WRAITH_07",  shadowId: "SS0012", vcHours: 61.3,  avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=wraith&backgroundColor=10B981" },
+  { id: "6", codename: "SILENTONE",  shadowId: "SS0031", vcHours: 43.0,  avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=silent&backgroundColor=6B6B9A" },
+  { id: "7", codename: "DRIFTER",    shadowId: "SS0088", vcHours: 22.5,  avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=drift&backgroundColor=E63946" },
+  { id: "8", codename: "INITIATE_9", shadowId: "SS0099", vcHours: 8.1,   avatar: "https://api.dicebear.com/7.x/shapes/svg?seed=init&backgroundColor=7B2FBE" },
+];
+
+// ── TIER CONFIG ───────────────────────────────────────────────────
+const TIERS = [
+  { name: "Voidborn", min: 5000, color: "#F0A500", glow: "rgba(240,165,0,0.6)" },
+  { name: "Wraith",   min: 3000, color: "#E63946", glow: "rgba(230,57,70,0.6)" },
+  { name: "Phantom",  min: 1500, color: "#A855F7", glow: "rgba(168,85,247,0.6)" },
+  { name: "Seeker",   min: 500,  color: "#7B2FBE", glow: "rgba(123,47,190,0.5)" },
+  { name: "Initiate", min: 0,    color: "#6B6B9A", glow: "rgba(107,107,154,0.4)" },
+];
+
+function getTier(echoes) {
+  return TIERS.find(t => echoes >= t.min) || TIERS[TIERS.length - 1];
+}
+
+const RANK_MEDALS = ["🥇", "🥈", "🥉"];
+
+// ── ANIMATED RACE BAR ─────────────────────────────────────────────
+function RaceBar({ pct, color, glow, rank, delay = 0 }) {
+  const [width, setWidth] = useState(0);
+  const [dotsOffset, setDotsOffset] = useState(0);
+  const animRef = useRef(null);
+  const startRef = useRef(null);
+
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      const duration = 900 + rank * 80;
+      const start = performance.now();
+      startRef.current = start;
+
+      const animate = (now) => {
+        const elapsed = now - start;
+        const progress = Math.min(elapsed / duration, 1);
+        // Ease out cubic
+        const eased = 1 - Math.pow(1 - progress, 3);
+        setWidth(eased * pct);
+        if (progress < 1) {
+          animRef.current = requestAnimationFrame(animate);
+        }
+      };
+      animRef.current = requestAnimationFrame(animate);
+    }, delay);
+
+    return () => {
+      clearTimeout(timeout);
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+    };
+  }, [pct, delay, rank]);
+
+  // Dots animation — independent continuous loop
+  useEffect(() => {
+    let frame;
+    let t = 0;
+    const loop = () => {
+      t += 0.8;
+      setDotsOffset(t % 28);
+      frame = requestAnimationFrame(loop);
+    };
+    frame = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  return (
+    <div style={{
+      position: "relative",
+      height: "18px",
+      background: "rgba(255,255,255,0.04)",
+      borderRadius: "9px",
+      overflow: "hidden",
+      flex: 1,
+    }}>
+      {/* Base fill */}
+      <div style={{
+        position: "absolute",
+        left: 0, top: 0, bottom: 0,
+        width: `${width}%`,
+        background: `linear-gradient(90deg, ${color}33, ${color}99, ${color})`,
+        borderRadius: "9px",
+        boxShadow: `0 0 12px ${glow}`,
+        transition: "none",
+      }} />
+
+      {/* Animated racing dots — the magic */}
+      <div style={{
+        position: "absolute",
+        left: 0, top: 0, bottom: 0,
+        width: `${width}%`,
+        borderRadius: "9px",
+        overflow: "hidden",
+        pointerEvents: "none",
+      }}>
+        <svg
+          style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
+          preserveAspectRatio="none"
+        >
+          <defs>
+            <pattern
+              id={`dots-${rank}`}
+              x={dotsOffset}
+              y="0"
+              width="28"
+              height="18"
+              patternUnits="userSpaceOnUse"
+            >
+              {/* Three dots per pattern tile, staggered sizes */}
+              <circle cx="4"  cy="9" r="2.5" fill={color} opacity="0.9" />
+              <circle cx="14" cy="9" r="1.8" fill={color} opacity="0.6" />
+              <circle cx="22" cy="9" r="1.2" fill={color} opacity="0.35" />
+            </pattern>
+          </defs>
+          <rect width="100%" height="100%" fill={`url(#dots-${rank})`} />
+        </svg>
+      </div>
+
+      {/* Bright leading edge */}
+      <div style={{
+        position: "absolute",
+        top: "2px",
+        bottom: "2px",
+        width: "40px",
+        right: `${100 - width}%`,
+        background: `linear-gradient(90deg, transparent, ${color}cc, white)`,
+        borderRadius: "4px",
+        filter: "blur(1px)",
+        opacity: width > 2 ? 0.7 : 0,
+        transform: "translateX(100%)",
+        transition: "none",
+      }} />
+    </div>
+  );
+}
+
+// ── SINGLE LEADERBOARD ROW ────────────────────────────────────────
+function LeaderRow({ entry, rank, maxVal, mode, delay, prevRank }) {
+  const pct = Math.max((entry.value / maxVal) * 92, 3);
+  const tier = mode === "echoes" ? getTier(entry.value) : { color: "#10B981", glow: "rgba(16,185,129,0.5)", name: "VC" };
+  const isTop3 = rank <= 3;
+
+  const valueLabel = mode === "echoes"
+    ? `${entry.value.toLocaleString()} ✦`
+    : `${entry.value.toFixed(1)}h`;
+
+  const rankMoved = prevRank && prevRank !== rank;
+  const rankUp = prevRank && prevRank > rank;
+
+  return (
+    <div style={{
+      display: "flex",
+      alignItems: "center",
+      gap: "12px",
+      padding: "10px 0",
+      opacity: 1,
+      animation: `fadeSlideIn 0.4s ease ${delay}ms both`,
+    }}>
+      {/* Rank number */}
+      <div style={{
+        width: "36px",
+        textAlign: "center",
+        fontFamily: "'Courier New', monospace",
+        fontSize: isTop3 ? "20px" : "14px",
+        lineHeight: 1,
+        flexShrink: 0,
+      }}>
+        {rank <= 3 ? RANK_MEDALS[rank - 1] : (
+          <span style={{ color: "#555", fontWeight: 700 }}>#{rank}</span>
+        )}
+      </div>
+
+      {/* Codename + bar + pfp */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: "5px" }}>
+        {/* Top row: name + value */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span style={{
+              fontFamily: "'Courier New', monospace",
+              fontWeight: 700,
+              fontSize: isTop3 ? "15px" : "13px",
+              color: isTop3 ? tier.color : "#ccc",
+              letterSpacing: "0.05em",
+              textShadow: isTop3 ? `0 0 10px ${tier.glow}` : "none",
+            }}>
+              {entry.codename}
+            </span>
+            {mode === "echoes" && (
+              <span style={{
+                fontSize: "10px",
+                color: tier.color,
+                opacity: 0.7,
+                fontFamily: "'Courier New', monospace",
+                background: `${tier.color}18`,
+                padding: "1px 6px",
+                borderRadius: "4px",
+                border: `1px solid ${tier.color}33`,
+              }}>
+                {tier.name}
+              </span>
+            )}
+            {rankMoved && (
+              <span style={{
+                fontSize: "10px",
+                color: rankUp ? "#10B981" : "#E63946",
+                opacity: 0.8,
+              }}>
+                {rankUp ? "▲" : "▼"}
+              </span>
+            )}
+          </div>
+          <span style={{
+            fontFamily: "'Courier New', monospace",
+            fontSize: "12px",
+            color: tier.color,
+            fontWeight: 700,
+            opacity: 0.9,
+          }}>
+            {valueLabel}
+          </span>
+        </div>
+
+        {/* Race bar row — bar + pfp at end */}
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <RaceBar
+            pct={pct}
+            color={tier.color}
+            glow={tier.glow}
+            rank={rank}
+            delay={delay}
+          />
+          {/* PFP at the end of the bar */}
+          <div style={{
+            width: "32px",
+            height: "32px",
+            borderRadius: "50%",
+            overflow: "hidden",
+            border: `2px solid ${tier.color}`,
+            boxShadow: `0 0 8px ${tier.glow}`,
+            flexShrink: 0,
+            background: "#1a1a2e",
+          }}>
+            <img
+              src={entry.avatar}
+              alt={entry.codename}
+              style={{ width: "100%", height: "100%", objectFit: "cover" }}
+              onError={e => { e.target.style.display = "none"; }}
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── MAIN LEADERBOARD ──────────────────────────────────────────────
+export default function ShadowLeaderboard() {
+  const [mode, setMode] = useState("echoes"); // "echoes" | "vc"
+  const [data, setData] = useState({ echoes: MOCK_ECHOES, vc: MOCK_VC });
+  const [tick, setTick] = useState(0);
+  const [lastUpdated, setLastUpdated] = useState(new Date());
+  const [transitioning, setTransitioning] = useState(false);
+
+  // Simulate live updates every 8 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setData(prev => {
+        const jitter = arr => arr.map(e => ({
+          ...e,
+          value: mode === "echoes"
+            ? Math.max(0, e.echoes + Math.floor((Math.random() - 0.3) * 80))
+            : Math.max(0, e.vcHours + (Math.random() * 0.5)),
+        }));
+        return prev;
+      });
+      setTick(t => t + 1);
+      setLastUpdated(new Date());
+    }, 8000);
+    return () => clearInterval(interval);
+  }, [mode]);
+
+  const switchMode = (newMode) => {
+    if (newMode === mode) return;
+    setTransitioning(true);
+    setTimeout(() => {
+      setMode(newMode);
+      setTransitioning(false);
+    }, 250);
+  };
+
+  const rows = (mode === "echoes" ? MOCK_ECHOES : MOCK_VC).map(e => ({
+    ...e,
+    value: mode === "echoes" ? e.echoes : e.vcHours,
+  })).sort((a, b) => b.value - a.value);
+
+  const maxVal = rows[0]?.value || 1;
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "#08080f",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: "24px 16px",
+      fontFamily: "'Courier New', monospace",
+    }}>
+      <style>{`
+        @keyframes fadeSlideIn {
+          from { opacity: 0; transform: translateX(-16px); }
+          to   { opacity: 1; transform: translateX(0); }
+        }
+        @keyframes pulseGlow {
+          0%, 100% { opacity: 0.5; }
+          50%       { opacity: 1; }
+        }
+        @keyframes scanline {
+          0%   { transform: translateY(-100%); }
+          100% { transform: translateY(100vh); }
+        }
+        @keyframes borderPulse {
+          0%, 100% { border-color: rgba(123,47,190,0.3); }
+          50%       { border-color: rgba(168,85,247,0.7); }
+        }
+        .mode-btn {
+          cursor: pointer;
+          padding: 8px 20px;
+          border-radius: 6px;
+          border: 1px solid rgba(255,255,255,0.1);
+          background: transparent;
+          color: #666;
+          font-family: 'Courier New', monospace;
+          font-size: 12px;
+          font-weight: 700;
+          letter-spacing: 0.1em;
+          transition: all 0.2s ease;
+        }
+        .mode-btn:hover {
+          border-color: rgba(168,85,247,0.5);
+          color: #ccc;
+        }
+        .mode-btn.active {
+          background: rgba(123,47,190,0.3);
+          border-color: #7B2FBE;
+          color: #A855F7;
+          box-shadow: 0 0 12px rgba(123,47,190,0.4);
+        }
+        .divider {
+          height: 1px;
+          background: linear-gradient(90deg, transparent, rgba(123,47,190,0.4), transparent);
+          margin: 4px 0;
+        }
+      `}</style>
+
+      <div style={{
+        width: "100%",
+        maxWidth: "580px",
+        background: "rgba(255,255,255,0.02)",
+        border: "1px solid rgba(123,47,190,0.25)",
+        borderRadius: "16px",
+        overflow: "hidden",
+        animation: "borderPulse 4s ease infinite",
+        position: "relative",
+      }}>
+
+        {/* Scanline overlay */}
+        <div style={{
+          position: "absolute", inset: 0,
+          background: "repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px)",
+          pointerEvents: "none", zIndex: 0,
+        }} />
+
+        {/* Header */}
+        <div style={{
+          padding: "20px 24px 16px",
+          borderBottom: "1px solid rgba(255,255,255,0.05)",
+          position: "relative", zIndex: 1,
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <div style={{
+                fontSize: "11px",
+                color: "#A855F7",
+                letterSpacing: "0.25em",
+                marginBottom: "4px",
+                opacity: 0.8,
+              }}>
+                ☽ SHADOWSEEKERS ORDER
+              </div>
+              <div style={{
+                fontSize: "22px",
+                fontWeight: 900,
+                color: "#fff",
+                letterSpacing: "0.08em",
+                lineHeight: 1,
+              }}>
+                {mode === "echoes" ? "ECHO RANKINGS" : "VC DOMINANCE"}
+              </div>
+            </div>
+
+            {/* Live indicator */}
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <div style={{
+                width: "8px", height: "8px",
+                borderRadius: "50%",
+                background: "#10B981",
+                animation: "pulseGlow 1.5s ease infinite",
+                boxShadow: "0 0 8px #10B981",
+              }} />
+              <span style={{ fontSize: "10px", color: "#10B981", letterSpacing: "0.1em" }}>LIVE</span>
+            </div>
+          </div>
+
+          {/* Mode switcher */}
+          <div style={{ display: "flex", gap: "8px", marginTop: "14px" }}>
+            <button className={`mode-btn ${mode === "echoes" ? "active" : ""}`} onClick={() => switchMode("echoes")}>
+              ✦ ECHOES
+            </button>
+            <button className={`mode-btn ${mode === "vc" ? "active" : ""}`} onClick={() => switchMode("vc")}>
+              🎙️ VC TIME
+            </button>
+          </div>
+        </div>
+
+        {/* Rows */}
+        <div style={{
+          padding: "8px 24px 20px",
+          position: "relative", zIndex: 1,
+          opacity: transitioning ? 0 : 1,
+          transition: "opacity 0.25s ease",
+        }}>
+          {rows.map((entry, i) => (
+            <div key={entry.id}>
+              <LeaderRow
+                entry={entry}
+                rank={i + 1}
+                maxVal={maxVal}
+                mode={mode}
+                delay={i * 80}
+              />
+              {i < rows.length - 1 && <div className="divider" />}
+            </div>
+          ))}
+        </div>
+
+        {/* Footer */}
+        <div style={{
+          padding: "10px 24px",
+          borderTop: "1px solid rgba(255,255,255,0.04)",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          position: "relative", zIndex: 1,
+        }}>
+          <span style={{ fontSize: "10px", color: "#333", letterSpacing: "0.1em" }}>
+            {rows.length} OPERATIVES RANKED
+          </span>
+          <span style={{ fontSize: "10px", color: "#333", letterSpacing: "0.05em" }}>
+            {lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
