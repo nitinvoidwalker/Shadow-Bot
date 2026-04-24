@@ -25,6 +25,10 @@ GENERAL_CHANNEL   = os.getenv("GENERAL_CHANNEL", "general")
 # Set MISSION_CHANNEL to post AI missions in a dedicated channel (e.g. "ai-missions")
 # Leave unset to fall back to GENERAL_CHANNEL
 MISSION_CHANNEL   = os.getenv("MISSION_CHANNEL", "")
+# Set MISSION_THREAD to post inside a specific thread name within MISSION_CHANNEL (or GENERAL_CHANNEL)
+# The bot will find an existing thread with that name or create one if it doesn't exist
+# e.g. MISSION_THREAD=daily-missions
+MISSION_THREAD    = os.getenv("MISSION_THREAD", "")
 MISSION_GEN_HOUR  = int(os.getenv("MISSION_GEN_HOUR", "6"))
 MISSION_GEN_MIN   = int(os.getenv("MISSION_GEN_MIN", "0"))
 TIMEZONE          = os.getenv("TIMEZONE", "Asia/Kolkata")
@@ -32,6 +36,53 @@ TIMEZONE          = os.getenv("TIMEZONE", "Asia/Kolkata")
 _pending_missions: dict[str, list[str]] = {}
 # UIDs who opted out of daily AI mission broadcasts
 _mission_optouts: set[str] = set()
+
+
+async def _resolve_mission_target(guild: discord.Guild) -> discord.abc.Messageable | None:
+    """
+    Returns the channel or thread where missions should be posted.
+    Priority:
+      1. If MISSION_THREAD is set — find or create a thread with that name
+         inside MISSION_CHANNEL (or GENERAL_CHANNEL as fallback).
+      2. If MISSION_CHANNEL is set — post directly in that channel.
+      3. Fall back to GENERAL_CHANNEL.
+    """
+    ch_name = MISSION_CHANNEL if MISSION_CHANNEL else GENERAL_CHANNEL
+    channel = discord.utils.get(guild.text_channels, name=ch_name)
+    if not channel:
+        channel = discord.utils.get(guild.text_channels, name=GENERAL_CHANNEL)
+    if not channel:
+        return None
+
+    if not MISSION_THREAD:
+        return channel
+
+    # Look for an existing active thread with that name
+    thread_name = MISSION_THREAD
+    for thread in channel.threads:
+        if thread.name.lower() == thread_name.lower():
+            return thread
+
+    # Also check archived threads
+    try:
+        async for thread in channel.archived_threads():
+            if thread.name.lower() == thread_name.lower():
+                await thread.unarchive()
+                return thread
+    except Exception:
+        pass
+
+    # Create a new thread if none found
+    try:
+        thread = await channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.public_thread,
+            reason="Shadow Bot — AI Mission thread",
+        )
+        return thread
+    except Exception as e:
+        print(f"[AI MISSIONS] Could not create thread '{thread_name}': {e}")
+        return channel  # fall back to channel itself
 
 
 # ── GROQ CALL ─────────────────────────────────────────────────────
@@ -357,12 +408,8 @@ async def ai_mission_task():
 
     data = await load_data()
     for guild in _bot_ref.guilds:
-        # Use dedicated mission channel if set, else fall back to general
-        target_ch_name = MISSION_CHANNEL if MISSION_CHANNEL else GENERAL_CHANNEL
-        mission_ch = discord.utils.get(guild.text_channels, name=target_ch_name)
-        if not mission_ch:
-            mission_ch = discord.utils.get(guild.text_channels, name=GENERAL_CHANNEL)
-        if not mission_ch:
+        mission_target = await _resolve_mission_target(guild)
+        if not mission_target:
             continue
         approved_uids = [uid for uid, link in data["links"].items() if link.get("approved")]
         print(f"[AI MISSIONS] Generating for {len(approved_uids)} operatives...")
@@ -380,7 +427,7 @@ async def ai_mission_task():
                 discord_member = guild.get_member(int(uid))
                 mention = discord_member.mention if discord_member else f"`{ctx['codename']}`"
                 embed = make_mission_embed(ctx["codename"], ctx["tier"], missions, ctx=ctx)
-                await mission_ch.send(content=f"{mention} — your missions for today have arrived.", embed=embed)
+                await mission_target.send(content=f"{mention} — your missions for today have arrived.", embed=embed)
             except Exception as e:
                 print(f"[AI MISSIONS] Error for uid={uid}: {e}")
 
@@ -588,4 +635,5 @@ def setup_ai_missions(bot, tree: app_commands.CommandTree):
     register_commands(tree)
     print("[AI MISSIONS] AI Mission Generator registered ✓")
     ch_display = MISSION_CHANNEL if MISSION_CHANNEL else f"{GENERAL_CHANNEL} (fallback)"
-    print(f"[AI MISSIONS] Daily broadcast at {MISSION_GEN_HOUR}:{MISSION_GEN_MIN:02d} {TIMEZONE} → #{ch_display}")
+    thread_display = f" → thread: {MISSION_THREAD}" if MISSION_THREAD else ""
+    print(f"[AI MISSIONS] Daily broadcast at {MISSION_GEN_HOUR}:{MISSION_GEN_MIN:02d} {TIMEZONE} → #{ch_display}{thread_display}")
