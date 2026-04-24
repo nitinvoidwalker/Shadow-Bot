@@ -89,15 +89,46 @@ GENERAL_CHANNEL      = os.getenv("GENERAL_CHANNEL", "general")
 POMODORO_MINUTES     = 25
 
 # ── LEADERBOARD CONFIG ────────────────────────────────────────────
-# Set LEADERBOARD_CHANNEL to the channel name where /leaderboard posts
-# Set VC_LEADERBOARD_CHANNEL for the VC hours leaderboard (can be same channel)
+# All live leaderboards + grind board post in LEADERBOARD_CHANNEL
 LEADERBOARD_CHANNEL    = os.getenv("LEADERBOARD_CHANNEL", "leaderboard")
 VC_LEADERBOARD_CHANNEL = os.getenv("VC_LEADERBOARD_CHANNEL", "leaderboard")
 SHADOWCARD_CHANNEL     = os.getenv("SHADOWCARD_CHANNEL", "shadowcard")
 
-# Realtime leaderboard — in-memory store of pinned message IDs per guild
-# Keys: "echo_{guild_id}" and "vc_{guild_id}"
+# In-memory cache of pinned message IDs per guild.
+# Keys: "echo_{guild_id}", "vc_{guild_id}", "weekly_{guild_id}", "daily_{guild_id}", "grind_{guild_id}"
+# Populated from MongoDB on startup so restarts don't cause duplicate posts.
 _lb_message_ids: dict = {}
+
+
+async def _load_lb_message_ids():
+    """Load persisted leaderboard message IDs from MongoDB into _lb_message_ids."""
+    db = get_db()
+    if db is None:
+        return
+    try:
+        doc = await db["lb_state"].find_one({"_id": "message_ids"})
+        if doc:
+            for k, v in doc.items():
+                if k != "_id":
+                    _lb_message_ids[k] = v
+            print(f"[LB STATE] Loaded {len(_lb_message_ids)} message IDs from MongoDB")
+    except Exception as e:
+        print(f"[LB STATE] Load error: {e}")
+
+
+async def _save_lb_message_ids():
+    """Persist current _lb_message_ids to MongoDB."""
+    db = get_db()
+    if db is None:
+        return
+    try:
+        await db["lb_state"].update_one(
+            {"_id": "message_ids"},
+            {"$set": {k: v for k, v in _lb_message_ids.items()}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[LB STATE] Save error: {e}")
 
 # ── MONGODB SETUP ─────────────────────────────────────────────────
 _mongo_client = None
@@ -459,71 +490,46 @@ async def create_member_on_gas(member: dict) -> bool:
     return False
 
 # ── ACTIVE SESSION TIMER LOOP ─────────────────────────────────────
-# FIX: Store message objects in memory; always edit in-place, never send new messages
-# from the ticker. The ticker only edits. If message is gone, clear the ref.
 _session_messages = {}   # uid -> discord.Message
-_live_board_message = None  # the one live board message in general
-
-async def purge_orphaned_boards(general_ch: discord.TextChannel):
-    """Scan recent channel history and delete any stale grind board messages the bot owns."""
-    global _live_board_message
-    try:
-        async for msg in general_ch.history(limit=50):
-            if msg.author != general_ch.guild.me:
-                continue
-            # Identify grind board messages by their embed title
-            if msg.embeds and msg.embeds[0].title and "GRIND BOARD" in msg.embeds[0].title:
-                # Skip the one we already have a ref to — it'll be deleted normally
-                if _live_board_message and msg.id == _live_board_message.id:
-                    continue
-                try:
-                    await msg.delete()
-                    print(f"[LIVE BOARD] Purged orphaned board message id={msg.id}")
-                except Exception:
-                    pass
-    except Exception as e:
-        print(f"[LIVE BOARD] Purge scan failed: {e}")
-
+# NOTE: grind board now lives in LEADERBOARD_CHANNEL, edited in-place via _lb_message_ids["grind_{guild_id}"]
 
 async def update_live_board(guild: discord.Guild):
-    """Delete and resend the live study board in general so it's always at the bottom."""
-    global _live_board_message
-
-    data = await load_data()
-    now  = time_module.time()
+    """Edit the live grind board in-place inside the leaderboard channel."""
+    data     = await load_data()
+    now      = time_module.time()
     sessions = data.get("active_sessions", {})
 
-    general_ch = discord.utils.get(guild.text_channels, name=GENERAL_CHANNEL)
-    if not general_ch:
+    lb_ch = discord.utils.get(guild.text_channels, name=LEADERBOARD_CHANNEL)
+    if not lb_ch:
         return
+
+    key = f"grind_{guild.id}"
 
     if not sessions:
-        # No one studying — delete board if it exists
-        if _live_board_message:
+        # No one studying — clear the board message if it exists
+        msg_id = _lb_message_ids.get(key)
+        if msg_id:
             try:
-                await _live_board_message.delete()
+                msg = await lb_ch.fetch_message(msg_id)
+                await msg.delete()
             except Exception:
                 pass
-            _live_board_message = None
-        # Also purge any orphans left from a previous run
-        await purge_orphaned_boards(general_ch)
+            _lb_message_ids.pop(key, None)
+            await _save_lb_message_ids()
         return
 
-    # Build one embed per operative — Discord shows author icon (pfp) per embed
-    embeds = []
-    ist       = pytz.timezone(TIMEZONE)
-    now_ist   = datetime.fromtimestamp(now, tz=ist)
-    updated   = now_ist.strftime("%I:%M %p")
-    count     = len(sessions)
+    ist      = pytz.timezone(TIMEZONE)
+    now_ist  = datetime.fromtimestamp(now, tz=ist)
+    updated  = now_ist.strftime("%I:%M %p")
+    count    = len(sessions)
 
-    # Header embed
     header_embed = make_embed(
         f"🦇 GRIND BOARD · {count} OPERATIVE{'S' if count != 1 else ''} LOCKED IN",
         "",
         color=0x7B2FBE
     )
     header_embed.set_footer(text=f"Updates every 20s · Last updated {updated} IST")
-    embeds.append(header_embed)
+    embeds = [header_embed]
 
     for uid, sess in sorted(sessions.items(), key=lambda x: x[1].get("start_time", 0)):
         elapsed   = int(now - sess.get("start_time", now))
@@ -537,7 +543,6 @@ async def update_live_board(guild: discord.Guild):
         time_str  = format_duration(elapsed)
         bar       = make_progress_bar(elapsed % 3600, 3600)
 
-        # Grab this operative's avatar
         avatar_url = None
         try:
             member_obj = guild.get_member(int(uid))
@@ -553,30 +558,28 @@ async def update_live_board(guild: discord.Guild):
             ),
             color=0xA855F7 if in_vc else 0x7B2FBE,
         )
-        op_embed.set_author(
-            name=f"{type_icon} {codename}",
-            icon_url=avatar_url,
-        )
+        op_embed.set_author(name=f"{type_icon} {codename}", icon_url=avatar_url)
         embeds.append(op_embed)
 
-    # Discord cap: 10 embeds per message
     embeds = embeds[:10]
 
-    # Purge any orphaned boards from previous bot runs before sending
-    await purge_orphaned_boards(general_ch)
-
-    # Delete the tracked message, send fresh one at bottom
-    if _live_board_message:
-        try:
-            await _live_board_message.delete()
-        except Exception:
-            pass
-        _live_board_message = None
-
+    msg_id = _lb_message_ids.get(key)
     try:
-        _live_board_message = await general_ch.send(embeds=embeds)
-    except Exception as e:
-        print(f"[LIVE BOARD] Failed to send: {e}")
+        if msg_id:
+            msg = await lb_ch.fetch_message(msg_id)
+            await msg.edit(embeds=embeds)
+        else:
+            msg = await lb_ch.send(embeds=embeds)
+            _lb_message_ids[key] = msg.id
+            await _save_lb_message_ids()
+    except (discord.NotFound, discord.HTTPException):
+        # Message was deleted — send fresh
+        try:
+            msg = await lb_ch.send(embeds=embeds)
+            _lb_message_ids[key] = msg.id
+            await _save_lb_message_ids()
+        except Exception as e:
+            print(f"[GRIND BOARD] Failed to send: {e}")
 
 
 @tasks.loop(seconds=20)
@@ -1382,17 +1385,13 @@ async def phantom_alert_task():
 _vc_join_times: dict = {}
 
 # ── REALTIME LEADERBOARD — ANIMATED PULSE ─────────────────────────
-# Dot patterns cycle per-rank so every line feels independent.
-# LIVE VC members get a double-pulse. Offline get a single travelling dot.
-# Thumbnail rotates through top-3 pfps every tick so the embed feels alive.
-
 _PULSE_FRAMES = [
-    ["◉ ○ ○", "○ ◉ ○", "○ ○ ◉"],   # rank offset 0
-    ["○ ◉ ○", "○ ○ ◉", "◉ ○ ○"],   # rank offset 1
-    ["○ ○ ◉", "◉ ○ ○", "○ ◉ ○"],   # rank offset 2
+    ["◉ ○ ○", "○ ◉ ○", "○ ○ ◉"],
+    ["○ ◉ ○", "○ ○ ◉", "◉ ○ ○"],
+    ["○ ○ ◉", "◉ ○ ○", "○ ◉ ○"],
 ]
-_LIVE_FRAMES  = ["◉ ◉ ○", "○ ◉ ◉", "◉ ○ ◉"]   # double-pulse for LIVE
-_lb_tick      = 0                               # global frame counter, incremented each refresh
+_LIVE_FRAMES  = ["◉ ◉ ○", "○ ◉ ◉", "◉ ○ ◉"]
+_lb_tick      = 0
 
 
 def _pulse(rank_idx: int, live: bool) -> str:
@@ -1409,8 +1408,27 @@ def _echo_bar(count: int, max_count: int, width: int = 8) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+async def _upsert_lb_message(lb_ch: discord.TextChannel, key: str, embed: discord.Embed):
+    """Edit existing leaderboard message in-place, or send a new one and persist its ID."""
+    msg_id = _lb_message_ids.get(key)
+    try:
+        if msg_id:
+            msg = await lb_ch.fetch_message(msg_id)
+            await msg.edit(embed=embed)
+            return
+    except (discord.NotFound, discord.HTTPException):
+        pass
+    # Send fresh and persist
+    try:
+        msg = await lb_ch.send(embed=embed)
+        _lb_message_ids[key] = msg.id
+        await _save_lb_message_ids()
+    except Exception as e:
+        print(f"[REALTIME LB] Send failed key={key}: {e}")
+
+
 async def refresh_realtime_leaderboards(guild: discord.Guild = None):
-    """Edit the pinned echo + VC leaderboard messages in-place. Creates them if missing."""
+    """Edit all 4 live leaderboard messages in-place (echo · vc · weekly · daily)."""
     global _lb_tick
     _lb_tick += 1
 
@@ -1422,175 +1440,260 @@ async def refresh_realtime_leaderboards(guild: discord.Guild = None):
     data   = await load_data()
     medals = ["🥇", "🥈", "🥉"]
     now_ts = discord.utils.utcnow().strftime("%d %b %Y · %H:%M UTC")
+    tz     = pytz.timezone(TIMEZONE)
+    now_dt = datetime.now(tz)
+    EMBED_DESC_LIMIT = 4000
 
-    # ── ECHO LEADERBOARD ──────────────────────────────────────────
     lb_ch = discord.utils.get(guild.text_channels, name=LEADERBOARD_CHANNEL)
-    if lb_ch:
-        sorted_m  = sorted(data["members"], key=lambda m: int(m.get("echoCount", 0)), reverse=True)[:10]
-        max_count = int(sorted_m[0].get("echoCount", 1)) if sorted_m else 1
-        lines     = []
-        thumb_url = None   # will be set to #1 pfp (rotates by tick)
-        EMBED_DESC_LIMIT = 4000  # Discord limit is 4096; leave headroom
+    if not lb_ch:
+        return
 
-        for i, m in enumerate(sorted_m):
-            count   = int(m.get("echoCount", 0))
-            rank    = medals[i] if i < 3 else f"`#{i+1}`"
-            tier    = get_tier(count)
-            uid_lnk = next(
-                (u for u, lnk in data.get("links", {}).items()
-                 if lnk.get("shadow_id") == m.get("shadowId") and lnk.get("approved")),
-                None
-            )
-            gm      = guild.get_member(int(uid_lnk)) if uid_lnk else None
-            mention = gm.mention if gm else f"**{m.get('codename', m.get('shadowId', '?'))}**"
+    # ── 1. ECHO LEADERBOARD (all-time) ────────────────────────────
+    sorted_m  = sorted(data["members"], key=lambda m: int(m.get("echoCount", 0)), reverse=True)[:10]
+    max_count = int(sorted_m[0].get("echoCount", 1)) if sorted_m else 1
+    lines, thumb_url = [], None
 
-            # Rotate thumbnail across top-3 each tick
-            if i == (_lb_tick % min(3, len(sorted_m))) and gm and gm.display_avatar:
-                thumb_url = gm.display_avatar.url
-
-            in_session = uid_lnk and uid_lnk in data.get("active_sessions", {})
-            is_live_vc = gm and gm.voice and gm.voice.channel is not None
-            pulse      = _pulse(i, is_live_vc or in_session)
-            bar        = _echo_bar(count, max_count)
-            session_dot = " 📖" if in_session else ""
-            vc_dot      = " 🎙️" if is_live_vc else ""
-
-            sg_count = 0
-            badges   = m.get("badges", {})
-            if isinstance(badges, str):
-                try: badges = json.loads(badges)
-                except: badges = {}
-            if isinstance(badges, dict):
-                sg_count = badges.get("shadow_grind", 0)
-            badge_str = f" 🏅×{sg_count}" if sg_count else ""
-
-            line = (
-                f"{rank} {mention}{vc_dot}{session_dot}\n"
-                f"╰ `{bar}` **{count:,}✦** · *{tier['name']}*{badge_str} · {pulse}"
-            )
-            # Stop adding entries if we'd exceed Discord's embed description limit
-            current_len = len("\n".join(lines)) + len(line) + 1
-            if current_len > EMBED_DESC_LIMIT:
-                break
-            lines.append(line)
-
-        echo_embed = make_embed(
-            "☽ ECHO LEADERBOARD",
-            "\n".join(lines) if lines else "*No operatives recorded yet.*",
-            color=0xF0A500
+    for i, m in enumerate(sorted_m):
+        count   = int(m.get("echoCount", 0))
+        rank    = medals[i] if i < 3 else f"`#{i+1}`"
+        tier    = get_tier(count)
+        uid_lnk = next(
+            (u for u, lnk in data.get("links", {}).items()
+             if lnk.get("shadow_id") == m.get("shadowId") and lnk.get("approved")),
+            None
         )
-        echo_embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · live · {now_ts}")
-        if thumb_url:
-            echo_embed.set_thumbnail(url=thumb_url)
+        gm      = guild.get_member(int(uid_lnk)) if uid_lnk else None
+        mention = gm.mention if gm else f"**{m.get('codename', m.get('shadowId', '?'))}**"
 
-        msg_id = _lb_message_ids.get(f"echo_{guild.id}")
-        try:
-            if msg_id:
-                msg = await lb_ch.fetch_message(msg_id)
-                await msg.edit(embed=echo_embed)
-            else:
-                msg = await lb_ch.send(embed=echo_embed)
-                _lb_message_ids[f"echo_{guild.id}"] = msg.id
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            try:
-                msg = await lb_ch.send(embed=echo_embed)
-                _lb_message_ids[f"echo_{guild.id}"] = msg.id
-            except Exception as e:
-                print(f"[REALTIME LB] Echo leaderboard error: {e}")
+        if i == (_lb_tick % min(3, len(sorted_m))) and gm and gm.display_avatar:
+            thumb_url = gm.display_avatar.url
 
-    # ── VC LEADERBOARD ────────────────────────────────────────────
-    vc_lb_ch = discord.utils.get(guild.text_channels, name=VC_LEADERBOARD_CHANNEL)
-    if vc_lb_ch:
-        vc_time = data.get("vc_time", {})
-        links   = data.get("links", {})
+        in_session  = uid_lnk and uid_lnk in data.get("active_sessions", {})
+        is_live_vc  = gm and gm.voice and gm.voice.channel is not None
+        pulse       = _pulse(i, is_live_vc or in_session)
+        bar         = _echo_bar(count, max_count)
+        session_dot = " 📖" if in_session else ""
+        vc_dot      = " 🎙️" if is_live_vc else ""
 
-        # Also include anyone currently in VC even if not yet saved to vc_time
-        all_uids = set(vc_time.keys()) | set(_vc_join_times.keys())
+        sg_count = 0
+        badges   = m.get("badges", {})
+        if isinstance(badges, str):
+            try: badges = json.loads(badges)
+            except: badges = {}
+        if isinstance(badges, dict):
+            sg_count = badges.get("shadow_grind", 0)
+        badge_str = f" 🏅×{sg_count}" if sg_count else ""
 
-        entries = []
-        for uid in all_uids:
-            saved_secs = int(vc_time.get(uid, 0))
-            # Add live delta if they're currently in VC right now
-            live_extra = int(time_module.time() - _vc_join_times[uid]) if uid in _vc_join_times else 0
-            total_secs = saved_secs + live_extra
-            if total_secs <= 0:
-                continue
-
-            gm       = guild.get_member(int(uid))
-            is_live  = uid in _vc_join_times  # currently in VC this session
-
-            # Try to get codename from links → members
-            link = links.get(uid, {})
-            if link.get("approved"):
-                shadow_id  = link["shadow_id"]
-                member_obj = next((m for m in data["members"] if m.get("shadowId") == shadow_id), None)
-                codename   = member_obj.get("codename", shadow_id) if member_obj else shadow_id
-            else:
-                codename = gm.display_name if gm else uid
-
-            entries.append({
-                "uid": uid, "codename": codename,
-                "seconds": total_secs,
-                "gm": gm, "live": is_live
-            })
-
-        entries.sort(key=lambda x: x["seconds"], reverse=True)
-        max_vc_secs = entries[0]["seconds"] if entries else 1
-
-        vc_lines  = []
-        vc_thumb  = None
-        EMBED_DESC_LIMIT = 4000  # Discord limit is 4096; leave headroom
-        for i, e in enumerate(entries[:10]):
-            rank     = medals[i] if i < 3 else f"`#{i+1}`"
-            h        = e["seconds"] // 3600
-            m_left   = (e["seconds"] % 3600) // 60
-            mention  = e["gm"].mention if e["gm"] else f"**{e['codename']}**"
-            pulse    = _pulse(i, e["live"])
-            live_tag = " 🔴 **LIVE**" if e["live"] else ""
-            bar      = _echo_bar(e["seconds"], max_vc_secs)
-
-            if i == (_lb_tick % min(3, len(entries))) and e["gm"] and e["gm"].display_avatar:
-                vc_thumb = e["gm"].display_avatar.url
-
-            line = (
-                f"{rank} {mention}{live_tag}\n"
-                f"╰ `{bar}` **{h}h {m_left}m** · {pulse}"
-            )
-            # Stop adding entries if we'd exceed Discord's embed description limit
-            current_len = len("\n".join(vc_lines)) + len(line) + 1
-            if current_len > EMBED_DESC_LIMIT:
-                break
-            vc_lines.append(line)
-
-        total_hrs = sum(e["seconds"] for e in entries) // 3600
-        vc_embed  = make_embed(
-            "🎙️ VC LEADERBOARD — TIME IN THE VOID",
-            "\n".join(vc_lines) if vc_lines else "*No VC time recorded yet. Join a voice channel to start.*",
-            color=0x10B981
+        line = (
+            f"{rank} {mention}{vc_dot}{session_dot}\n"
+            f"╰ `{bar}` **{count:,}✦** · *{tier['name']}*{badge_str} · {pulse}"
         )
-        vc_embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · {total_hrs}h total · live · {now_ts}")
-        if vc_thumb:
-            vc_embed.set_thumbnail(url=vc_thumb)
+        if len("\n".join(lines)) + len(line) + 1 > EMBED_DESC_LIMIT:
+            break
+        lines.append(line)
 
-        msg_id = _lb_message_ids.get(f"vc_{guild.id}")
-        try:
-            if msg_id:
-                msg = await vc_lb_ch.fetch_message(msg_id)
-                await msg.edit(embed=vc_embed)
-            else:
-                msg = await vc_lb_ch.send(embed=vc_embed)
-                _lb_message_ids[f"vc_{guild.id}"] = msg.id
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            try:
-                msg = await vc_lb_ch.send(embed=vc_embed)
-                _lb_message_ids[f"vc_{guild.id}"] = msg.id
-            except Exception as e:
-                print(f"[REALTIME LB] VC leaderboard error: {e}")
+    echo_embed = make_embed(
+        "☽ ECHO LEADERBOARD",
+        "\n".join(lines) if lines else "*No operatives recorded yet.*",
+        color=0xF0A500
+    )
+    echo_embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · all-time · {now_ts}")
+    if thumb_url:
+        echo_embed.set_thumbnail(url=thumb_url)
+    await _upsert_lb_message(lb_ch, f"echo_{guild.id}", echo_embed)
+
+    # ── 2. VC LEADERBOARD (all-time) ──────────────────────────────
+    vc_time  = data.get("vc_time", {})
+    links    = data.get("links", {})
+    all_uids = set(vc_time.keys()) | set(_vc_join_times.keys())
+    entries  = []
+
+    for uid in all_uids:
+        saved_secs = int(vc_time.get(uid, 0))
+        live_extra = int(time_module.time() - _vc_join_times[uid]) if uid in _vc_join_times else 0
+        total_secs = saved_secs + live_extra
+        if total_secs <= 0:
+            continue
+        gm      = guild.get_member(int(uid))
+        is_live = uid in _vc_join_times
+        link    = links.get(uid, {})
+        if link.get("approved"):
+            shadow_id  = link["shadow_id"]
+            member_obj = next((m for m in data["members"] if m.get("shadowId") == shadow_id), None)
+            codename   = member_obj.get("codename", shadow_id) if member_obj else shadow_id
+        else:
+            codename = gm.display_name if gm else uid
+        entries.append({"uid": uid, "codename": codename, "seconds": total_secs, "gm": gm, "live": is_live})
+
+    entries.sort(key=lambda x: x["seconds"], reverse=True)
+    max_vc_secs = entries[0]["seconds"] if entries else 1
+    vc_lines, vc_thumb = [], None
+
+    for i, e in enumerate(entries[:10]):
+        rank     = medals[i] if i < 3 else f"`#{i+1}`"
+        h        = e["seconds"] // 3600
+        m_left   = (e["seconds"] % 3600) // 60
+        mention  = e["gm"].mention if e["gm"] else f"**{e['codename']}**"
+        pulse    = _pulse(i, e["live"])
+        live_tag = " 🔴 **LIVE**" if e["live"] else ""
+        bar      = _echo_bar(e["seconds"], max_vc_secs)
+        if i == (_lb_tick % min(3, len(entries))) and e["gm"] and e["gm"].display_avatar:
+            vc_thumb = e["gm"].display_avatar.url
+        line = (
+            f"{rank} {mention}{live_tag}\n"
+            f"╰ `{bar}` **{h}h {m_left}m** · {pulse}"
+        )
+        if len("\n".join(vc_lines)) + len(line) + 1 > EMBED_DESC_LIMIT:
+            break
+        vc_lines.append(line)
+
+    total_hrs = sum(e["seconds"] for e in entries) // 3600
+    vc_embed  = make_embed(
+        "🎙️ VC LEADERBOARD — TIME IN THE VOID",
+        "\n".join(vc_lines) if vc_lines else "*No VC time recorded yet.*",
+        color=0x10B981
+    )
+    vc_embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · {total_hrs}h total · all-time · {now_ts}")
+    if vc_thumb:
+        vc_embed.set_thumbnail(url=vc_thumb)
+    await _upsert_lb_message(lb_ch, f"vc_{guild.id}", vc_embed)
+
+    # ── 3. WEEKLY LEADERBOARD — echo gains + study hours this week ─
+    week_dates = set()
+    for i in range(7):
+        d = now_dt - timedelta(days=i)
+        week_dates.add(d.strftime("%m/%d"))
+
+    weekly_entries = []
+    for uid, link in data.get("links", {}).items():
+        if not link.get("approved"):
+            continue
+        shadow_id  = link["shadow_id"]
+        member_obj = next((m for m in data["members"] if m.get("shadowId") == shadow_id), None)
+        if not member_obj:
+            continue
+        codename = member_obj.get("codename", shadow_id)
+        history  = data.get("session_history", {}).get(uid, [])
+        week_sessions = [s for s in history if s.get("date") in week_dates]
+        week_echoes   = sum(s.get("awarded", 0) for s in week_sessions)
+        week_secs     = sum(s.get("duration_seconds", 0) for s in week_sessions)
+        week_sessions_count = len(week_sessions)
+        if week_echoes == 0 and week_secs == 0:
+            continue
+        gm = guild.get_member(int(uid))
+        weekly_entries.append({
+            "uid": uid, "codename": codename, "gm": gm,
+            "echoes": week_echoes, "seconds": week_secs,
+            "sessions": week_sessions_count,
+        })
+
+    weekly_entries.sort(key=lambda x: (x["echoes"], x["seconds"]), reverse=True)
+    max_w_echoes = weekly_entries[0]["echoes"] if weekly_entries else 1
+    w_lines, w_thumb = [], None
+
+    for i, e in enumerate(weekly_entries[:10]):
+        rank    = medals[i] if i < 3 else f"`#{i+1}`"
+        mention = e["gm"].mention if e["gm"] else f"**{e['codename']}**"
+        h       = e["seconds"] // 3600
+        m_left  = (e["seconds"] % 3600) // 60
+        bar     = _echo_bar(e["echoes"], max_w_echoes)
+        in_sess = e["uid"] in data.get("active_sessions", {})
+        pulse   = _pulse(i, in_sess)
+        if i == (_lb_tick % min(3, len(weekly_entries))) and e["gm"] and e["gm"].display_avatar:
+            w_thumb = e["gm"].display_avatar.url
+        line = (
+            f"{rank} {mention}\n"
+            f"╰ `{bar}` **+{e['echoes']}✦** · {h}h {m_left}m · {e['sessions']} sessions · {pulse}"
+        )
+        if len("\n".join(w_lines)) + len(line) + 1 > EMBED_DESC_LIMIT:
+            break
+        w_lines.append(line)
+
+    # Figure out days left in the week (resets Monday)
+    days_to_monday = (7 - now_dt.weekday()) % 7 or 7
+    week_start = (now_dt - timedelta(days=now_dt.weekday())).strftime("%d %b")
+    weekly_embed = make_embed(
+        "📅 WEEKLY GRIND — THIS WEEK'S OPERATIVES",
+        "\n".join(w_lines) if w_lines else "*No sessions logged this week yet.*",
+        color=0xA855F7
+    )
+    weekly_embed.set_footer(
+        text=f"☽ SHADOWSEEKERS ORDER · week of {week_start} · resets in {days_to_monday}d · {now_ts}"
+    )
+    if w_thumb:
+        weekly_embed.set_thumbnail(url=w_thumb)
+    await _upsert_lb_message(lb_ch, f"weekly_{guild.id}", weekly_embed)
+
+    # ── 4. DAILY LEADERBOARD — today's study hours + echoes earned ─
+    today_str_val = now_dt.strftime("%m/%d")
+    daily_entries = []
+
+    for uid, link in data.get("links", {}).items():
+        if not link.get("approved"):
+            continue
+        shadow_id  = link["shadow_id"]
+        member_obj = next((m for m in data["members"] if m.get("shadowId") == shadow_id), None)
+        if not member_obj:
+            continue
+        codename = member_obj.get("codename", shadow_id)
+        history  = data.get("session_history", {}).get(uid, [])
+        today_sessions = [s for s in history if s.get("date") == today_str_val]
+        today_echoes   = sum(s.get("awarded", 0) for s in today_sessions)
+        today_secs     = sum(s.get("duration_seconds", 0) for s in today_sessions)
+
+        # Add live session time for currently active session
+        active_sess = data.get("active_sessions", {}).get(uid)
+        is_live     = False
+        if active_sess and isinstance(active_sess, dict):
+            live_secs   = int(time_module.time() - active_sess.get("start_time", 0))
+            today_secs += live_secs
+            is_live     = True
+
+        if today_echoes == 0 and today_secs == 0:
+            continue
+
+        gm = guild.get_member(int(uid))
+        daily_entries.append({
+            "uid": uid, "codename": codename, "gm": gm,
+            "echoes": today_echoes, "seconds": today_secs, "live": is_live,
+        })
+
+    daily_entries.sort(key=lambda x: (x["seconds"], x["echoes"]), reverse=True)
+    max_d_secs = daily_entries[0]["seconds"] if daily_entries else 1
+    d_lines, d_thumb = [], None
+
+    for i, e in enumerate(daily_entries[:10]):
+        rank     = medals[i] if i < 3 else f"`#{i+1}`"
+        mention  = e["gm"].mention if e["gm"] else f"**{e['codename']}**"
+        h        = e["seconds"] // 3600
+        m_left   = (e["seconds"] % 3600) // 60
+        bar      = _echo_bar(e["seconds"], max_d_secs)
+        live_tag = " 🔴" if e["live"] else ""
+        pulse    = _pulse(i, e["live"])
+        if i == (_lb_tick % min(3, len(daily_entries))) and e["gm"] and e["gm"].display_avatar:
+            d_thumb = e["gm"].display_avatar.url
+        line = (
+            f"{rank} {mention}{live_tag}\n"
+            f"╰ `{bar}` **{h}h {m_left}m** · +{e['echoes']}✦ today · {pulse}"
+        )
+        if len("\n".join(d_lines)) + len(line) + 1 > EMBED_DESC_LIMIT:
+            break
+        d_lines.append(line)
+
+    daily_embed = make_embed(
+        f"🌑 TODAY'S GRIND — {now_dt.strftime('%d %b %Y')}",
+        "\n".join(d_lines) if d_lines else "*No sessions logged today yet. Start one with `/study`.*",
+        color=0x6B6B9A
+    )
+    daily_embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · today · resets at midnight · {now_ts}")
+    if d_thumb:
+        daily_embed.set_thumbnail(url=d_thumb)
+    await _upsert_lb_message(lb_ch, f"daily_{guild.id}", daily_embed)
 
 
 @tasks.loop(seconds=45)
 async def lb_tick_task():
-    """Background pulse — refreshes both leaderboards every 45s so dots animate on their own."""
+    """Background pulse — refreshes all leaderboards every 45s."""
     for g in bot.guilds:
         try:
             await refresh_realtime_leaderboards(g)
@@ -4297,12 +4400,8 @@ async def on_ready():
     except Exception as e:
         print(f"[TOKENS] Seeding error: {e}")
 
-    # Purge any leftover grind boards from before the restart
-    for guild in bot.guilds:
-        general_ch = discord.utils.get(guild.text_channels, name=GENERAL_CHANNEL)
-        if general_ch:
-            await purge_orphaned_boards(general_ch)
-            print("[LIVE BOARD] Startup purge complete")
+    # Load persisted leaderboard message IDs so we edit in-place after restarts
+    await _load_lb_message_ids()
 
     daily_echo_task.start()
     session_ticker.start()
@@ -4465,3 +4564,4 @@ async def viewshadowcard_cmd(interaction: discord.Interaction, user: discord.Mem
     embed.set_image(url=card["image_url"])
     embed.set_footer(text="☽ SHADOWSEEKERS ORDER · Shadow Records")
     await interaction.followup.send(embed=embed)
+
