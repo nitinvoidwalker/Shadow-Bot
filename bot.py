@@ -93,6 +93,7 @@ POMODORO_MINUTES     = 25
 # Set VC_LEADERBOARD_CHANNEL for the VC hours leaderboard (can be same channel)
 LEADERBOARD_CHANNEL    = os.getenv("LEADERBOARD_CHANNEL", "leaderboard")
 VC_LEADERBOARD_CHANNEL = os.getenv("VC_LEADERBOARD_CHANNEL", "leaderboard")
+SHADOWCARD_CHANNEL     = os.getenv("SHADOWCARD_CHANNEL", "shadowcard")
 
 # Realtime leaderboard — in-memory store of pinned message IDs per guild
 # Keys: "echo_{guild_id}" and "vc_{guild_id}"
@@ -517,7 +518,7 @@ async def update_live_board(guild: discord.Guild):
 
     # Header embed
     header_embed = make_embed(
-        f"🟢 GRIND BOARD · {count} OPERATIVE{'S' if count != 1 else ''} LOCKED IN",
+        f"🦇 GRIND BOARD · {count} OPERATIVE{'S' if count != 1 else ''} LOCKED IN",
         "",
         color=0x7B2FBE
     )
@@ -4334,3 +4335,133 @@ async def on_ready():
     print("[SHADOW BOT] Realtime leaderboards seeded")
 
 bot.run(TOKEN)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /shadowcard — Admin uploads a Shadow Card image
+#  Card stored in MongoDB and displayed in shadowcard channel
+#  Syncs shadowCardImage to Shadow Records via GAS
+# ══════════════════════════════════════════════════════════════════
+
+async def _save_shadowcard_db(shadow_id: str, image_url: str, uploader_id: str):
+    db = get_db()
+    if db is not None:
+        await db["shadowcards"].update_one(
+            {"_id": shadow_id},
+            {"$set": {
+                "shadow_id":   shadow_id,
+                "image_url":   image_url,
+                "uploaded_by": uploader_id,
+                "uploaded_at": datetime.now(pytz.timezone(TIMEZONE)).isoformat(),
+            }},
+            upsert=True,
+        )
+
+async def _get_shadowcard_db(shadow_id: str):
+    db = get_db()
+    if db is not None:
+        return await db["shadowcards"].find_one({"_id": shadow_id})
+    return None
+
+async def _push_shadowcard_to_gas(shadow_id: str, image_url: str):
+    try:
+        payload = json.dumps({"action": "updateShadowCard", "shadowId": shadow_id, "shadowCardImage": image_url})
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(GAS_URL, data=payload, headers={"Content-Type": "text/plain"},
+                                 timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                print(f"[SHADOWCARD] GAS push status={resp.status} sid={shadow_id}")
+    except Exception as e:
+        print(f"[SHADOWCARD] GAS push error: {e}")
+
+
+@tree.command(name="shadowcard", description="[HIGH CLEARANCE] Upload a Shadow Card image for an operative")
+@app_commands.describe(
+    user="The operative to assign this card to",
+    image="Upload the Shadow Card image directly",
+    image_url="Or paste a direct image URL instead of uploading",
+)
+async def shadowcard_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    image: discord.Attachment = None,
+    image_url: str = None,
+):
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            embed=make_embed("▲ CLEARANCE DENIED", "High clearance required.", color=0xE63946), ephemeral=True)
+        return
+    if not image and not image_url:
+        await interaction.response.send_message(
+            embed=make_embed("▲ IMAGE REQUIRED", "Provide an image upload **or** a direct image URL.", color=0xE63946),
+            ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    data      = await load_data()
+    uid       = str(user.id)
+    shadow_id = get_shadow_id(uid, data)
+    if not shadow_id:
+        await interaction.followup.send(
+            embed=make_embed("▲ NOT LINKED", f"**{user.display_name}** has no linked Shadow ID.", color=0xE63946))
+        return
+
+    final_url = image.url if image else image_url.strip()
+
+    # Save to MongoDB
+    await _save_shadowcard_db(shadow_id, final_url, str(interaction.user.id))
+
+    # Update member record for GAS/website
+    for i, m in enumerate(data["members"]):
+        if m["shadowId"] == shadow_id:
+            data["members"][i]["shadowCardImage"] = final_url
+            break
+    await save_data(data)
+    asyncio.create_task(_push_shadowcard_to_gas(shadow_id, final_url))
+
+    member_obj = get_member(shadow_id, data)
+    codename   = member_obj.get("codename", shadow_id) if member_obj else shadow_id
+
+    card_embed = discord.Embed(
+        title=f"🃏 SHADOW CARD — {codename}",
+        description=f"**Shadow ID:** `{shadow_id}`\n**Operative:** {user.mention}\n\n*Now live on Shadow Records.*",
+        color=0x7B2FBE,
+    )
+    card_embed.set_image(url=final_url)
+    card_embed.set_footer(text=f"☽ SHADOWSEEKERS ORDER · Uploaded by {interaction.user.display_name}")
+
+    sc_ch = discord.utils.get(interaction.guild.text_channels, name=SHADOWCARD_CHANNEL)
+    if sc_ch and sc_ch.id != interaction.channel_id:
+        await sc_ch.send(embed=card_embed)
+        await interaction.followup.send(
+            embed=make_embed("🃏 SHADOW CARD UPLOADED",
+                f"`{shadow_id}` — **{codename}**\nPosted in {sc_ch.mention} and synced to Shadow Records.",
+                color=0x10B981))
+    else:
+        await interaction.followup.send(embed=card_embed)
+
+
+@tree.command(name="viewshadowcard", description="View the Shadow Card for an operative")
+@app_commands.describe(user="The operative whose card you want to view (leave blank for your own)")
+async def viewshadowcard_cmd(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer()
+    target    = user or interaction.user
+    data      = await load_data()
+    uid       = str(target.id)
+    shadow_id = get_shadow_id(uid, data)
+    if not shadow_id:
+        await interaction.followup.send(
+            embed=make_embed("▲ NOT LINKED", f"**{target.display_name}** has no linked Shadow ID.", color=0xE63946))
+        return
+    card = await _get_shadowcard_db(shadow_id)
+    if not card:
+        await interaction.followup.send(embed=make_embed(
+            "◈ NO SHADOW CARD",
+            f"No Shadow Card set yet for `{shadow_id}`.\nAdmins can upload one with `/shadowcard @{target.display_name}`.",
+            color=0x6B6B9A))
+        return
+    member_obj = get_member(shadow_id, data)
+    codename   = member_obj.get("codename", shadow_id) if member_obj else shadow_id
+    embed = discord.Embed(title=f"🃏 SHADOW CARD — {codename}", description=f"**Shadow ID:** `{shadow_id}`", color=0x7B2FBE)
+    embed.set_image(url=card["image_url"])
+    embed.set_footer(text="☽ SHADOWSEEKERS ORDER · Shadow Records")
+    await interaction.followup.send(embed=embed)
